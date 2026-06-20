@@ -1,31 +1,35 @@
 #!/bin/bash
-# Bake MuseTalk inference weights into the image. Run with cwd = the MuseTalk checkout (weights land in
-# ./models, matching the relative paths the handler passes to scripts.inference).
+# Bake MuseTalk inference weights (~7.3GB) into the image. Run with cwd = the MuseTalk checkout
+# (weights land in ./models, the paths handler.py / scripts.inference expect). Drops syncnet (training-only).
 #
-# Adapted from upstream download_weights.sh: drops syncnet (training-only, not used at inference) and
-# uses the DEFAULT HuggingFace endpoint (upstream forces the hf-mirror.com CN mirror -- slow/unreliable
-# from Hetzner/RunPod). Total ~5GB baked (no network volume, same approach as the rest of the stack).
+# Uses huggingface_hub's Python API (the Dockerfile pins hub==0.25.2). DO NOT `pip install -U
+# huggingface_hub[cli]` here: hub 1.x makes the `huggingface-cli` command a no-op (silent empty download)
+# AND breaks transformers 4.39.2. Both bit us in Phase 0; this path is the one that worked.
 set -euo pipefail
-Ck="models"
-mkdir -p "$Ck/musetalk" "$Ck/musetalkV15" "$Ck/dwpose" "$Ck/face-parse-bisent" "$Ck/sd-vae" "$Ck/whisper"
-pip install --no-cache-dir -U "huggingface_hub[cli]" gdown
 
-# MuseTalk V1.0 + V1.5 UNet (V1.5 = default/best)
-huggingface-cli download TMElyralab/MuseTalk --local-dir "$Ck" \
-  --include "musetalk/musetalk.json" "musetalk/pytorch_model.bin" \
-            "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
-# SD VAE (ft-mse) -- the latent decoder
-huggingface-cli download stabilityai/sd-vae-ft-mse --local-dir "$Ck/sd-vae" \
-  --include "config.json" "diffusion_pytorch_model.bin"
-# Whisper-tiny -- audio encoder
-huggingface-cli download openai/whisper-tiny --local-dir "$Ck/whisper" \
-  --include "config.json" "pytorch_model.bin" "preprocessor_config.json"
-# DWPose -- face landmarks (needs mmpose/mmcv at runtime)
-huggingface-cli download yzd-v/DWPose --local-dir "$Ck/dwpose" \
-  --include "dw-ll_ucoco_384.pth"
-# Face parsing (BiSeNet) -- mouth-region mask for blending
-gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O "$Ck/face-parse-bisent/79999_iter.pth"
-curl -fsSL https://download.pytorch.org/models/resnet18-5c106cde.pth \
-  -o "$Ck/face-parse-bisent/resnet18-5c106cde.pth"
+python - <<'PY'
+from huggingface_hub import hf_hub_download
+jobs = [
+    ("TMElyralab/MuseTalk", "musetalkV15/musetalk.json",     "models"),
+    ("TMElyralab/MuseTalk", "musetalkV15/unet.pth",          "models"),
+    ("TMElyralab/MuseTalk", "musetalk/musetalk.json",        "models"),
+    ("TMElyralab/MuseTalk", "musetalk/pytorch_model.bin",    "models"),
+    ("stabilityai/sd-vae-ft-mse", "config.json",                 "models/sd-vae"),
+    ("stabilityai/sd-vae-ft-mse", "diffusion_pytorch_model.bin", "models/sd-vae"),
+    ("openai/whisper-tiny", "config.json",             "models/whisper"),
+    ("openai/whisper-tiny", "pytorch_model.bin",       "models/whisper"),
+    ("openai/whisper-tiny", "preprocessor_config.json","models/whisper"),
+    ("yzd-v/DWPose", "dw-ll_ucoco_384.pth", "models/dwpose"),
+]
+for repo, fn, ld in jobs:
+    hf_hub_download(repo_id=repo, filename=fn, local_dir=ld)
+    print("ok", repo, fn)
+print("HF weights done")
+PY
 
-echo "MuseTalk weights baked into $Ck."
+# Face parsing (BiSeNet) -- gdown from Google Drive + the torchvision resnet18 backbone.
+mkdir -p models/face-parse-bisent
+gdown "https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812" -O models/face-parse-bisent/79999_iter.pth
+curl -fsSL https://download.pytorch.org/models/resnet18-5c106cde.pth -o models/face-parse-bisent/resnet18-5c106cde.pth
+
+echo "MuseTalk weights baked into ./models (~7.3GB)."

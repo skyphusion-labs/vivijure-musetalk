@@ -1,26 +1,21 @@
-# MuseTalk inference deps (from upstream requirements.txt; gradio dropped -- no UI in a module).
-# NOTE: upstream targets torch 2.0.1, but this image runs torch 2.8 / cu128 (mandatory for RunPod's
-# Blackwell cards -- see the Dockerfile). diffusers/transformers pins may need a bump on that newer
-# torch; that, plus mmcv/mmpose (installed via openmim in the Dockerfile), is what Phase 0 burns down.
-diffusers==0.30.2
-accelerate==0.28.0
-numpy==1.23.5
-tensorflow==2.12.0
-tensorboard==2.12.0
-opencv-python==4.9.0.80
-soundfile==0.12.1
-transformers==4.39.2
-huggingface_hub==0.30.2
-librosa==0.11.0
-einops==0.8.1
-omegaconf
-ffmpeg-python
-moviepy
-imageio[ffmpeg]
-gdown
-
-# --- module runtime (the RunPod / R2 contract) ---
-runpod
-boto3
-requests
-pyyaml
+# NOTE: the real install is STAGED in the Dockerfile -- order + flags (--no-deps, --no-build-isolation,
+# MMCV_WITH_OPS, the version pins) matter, and a flat `pip install -r requirements.txt` will NOT
+# reproduce a working environment. This file is a human-readable manifest of the proven pin set,
+# validated end-to-end in Phase 0 on a live L40S (cu128/torch2.8/py3.12, 2026-06-20).
+#
+# build / py3.12 fixes:
+#   setuptools==75.6.0  wheel  ninja  cython  numpy  pillow  scipy  matplotlib
+#
+# openmmlab (no prebuilt mmcv for cu128/torch2.8 -> mmcv built from source; chumpy OMITTED on purpose):
+#   mmengine>=0.10   mmcv==2.1.0   mmpose==1.3.2   mmdet==3.2.0
+#   hand-installed mm deps: json_tricks  munkres  pycocotools  terminaltables  shapely  xtcocotools
+#
+# MuseTalk inference (huggingface_hub PINNED <1.0 -- 1.x breaks transformers 4.39.2 + the CLI):
+#   diffusers==0.30.2  accelerate==0.28.0  transformers==4.39.2  huggingface_hub==0.25.2
+#   omegaconf  librosa  soundfile  opencv-python  einops  imageio[ffmpeg]  ffmpeg-python  moviepy  gdown
+#
+# module runtime (the RunPod / R2 contract):
+#   runpod  boto3  pyyaml
+#
+# runtime env (set in the Dockerfile): TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 (torch 2.6+ load fix),
+#   CUDA_HOME=/usr/local/cuda, HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 (weights are baked).
