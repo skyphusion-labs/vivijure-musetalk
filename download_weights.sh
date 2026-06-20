@@ -7,6 +7,11 @@
 # AND breaks transformers 4.39.2. Both bit us in Phase 0; this path is the one that worked.
 set -euo pipefail
 
+# The RunPod base image sets HF_HUB_ENABLE_HF_TRANSFER=1 (it expects the Rust fast-downloader), but we
+# don't ship the `hf_transfer` package -- so hf_hub_download raises ValueError inside `docker build`.
+# Disable it: the standard http download is plenty for a one-time bake and adds no dependency.
+export HF_HUB_ENABLE_HF_TRANSFER=0
+
 python - <<'PY'
 from huggingface_hub import hf_hub_download
 jobs = [
