@@ -5,14 +5,20 @@
 #
 # Base: RunPod's torch 2.8 / cu128 image -- VALIDATED end-to-end in Phase 0 on a live L40S (2026-06-20).
 # Chosen over pytorch/pytorch:*-runtime because it ships the FULL CUDA 12.8 toolkit (nvcc), which mmcv's
-# source build needs; its torch arch list covers sm_100/sm_120 (B200/Blackwell), the reason for cu128.
-# It is py3.12, so the openmmlab stack needs the workarounds below -- every one proven on the pod, not
-# guessed. See the README "Phase 0 recipe" section for why each line exists.
+# source build needs. It is py3.12, so the openmmlab stack needs the workarounds below -- every one
+# proven on the pod, not guessed. See the README "Phase 0 recipe" section for why each line exists.
 FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
+# TORCH_CUDA_ARCH_LIST = the GPU archs mmcv compiles CUDA ops for. RunPod serverless can hand us (or
+# substitute) Ampere (A40/A10 = 8.6), Ada (L4/L40S = 8.9), Hopper (H100/H200 = 9.0), or Blackwell-Pro
+# (RTX PRO 6000 = 12.0). A100 (8.0) and B200 (10.0) are left out -- we won't run a light module on those
+# tiers; add them if a deploy lands there ("no kernel image is available for execution" = the running
+# GPU's arch is missing from this list). MAX_JOBS bounds compile parallelism so the multi-arch build
+# doesn't OOM the runner.
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_BREAK_SYSTEM_PACKAGES=1 \
     CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:${PATH} \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;12.0" \
+    TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;12.0" \
+    MAX_JOBS=4 \
     TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,9 +33,9 @@ RUN git clone --depth 1 https://github.com/TMElyralab/MuseTalk /app/MuseTalk
 RUN pip install --no-cache-dir -U "setuptools==75.6.0" wheel ninja cython numpy pillow scipy matplotlib
 
 # openmmlab stack. No prebuilt mmcv exists for cu128/torch2.8 (verified -- 404), so mmcv builds from
-# source against torch 2.8 (nvcc present; ~10-20 min). mmpose/mmdet go in --no-deps to SKIP chumpy
-# (py3.12-broken, 3D-body-only, unused) and pin the mmcv-2.1.0-compatible versions; their real deps are
-# installed by hand. --no-build-isolation makes the old sdists use this env's setuptools, not pip's 82.
+# source against torch 2.8 (nvcc present). mmpose/mmdet go in --no-deps to SKIP chumpy (py3.12-broken,
+# 3D-body-only, unused) and pin the mmcv-2.1.0-compatible versions; their real deps are installed by
+# hand. --no-build-isolation makes the old sdists use this env's setuptools, not pip's 82.
 RUN pip install --no-cache-dir "mmengine>=0.10" && \
     MMCV_WITH_OPS=1 pip install --no-cache-dir --no-build-isolation "mmcv==2.1.0" && \
     pip install --no-cache-dir json_tricks munkres pycocotools terminaltables shapely && \
