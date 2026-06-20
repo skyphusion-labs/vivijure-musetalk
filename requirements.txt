@@ -2,7 +2,7 @@
 # NOTE: upstream targets torch 2.0.1, but this image runs torch 2.8 / cu128 (mandatory for RunPod's
 # Blackwell cards -- see the Dockerfile). diffusers/transformers pins may need a bump on that newer
 # torch; that, plus mmcv/mmpose (installed via openmim in the Dockerfile), is what Phase 0 burns down.
-diffusers==0.30.2
+diffusers==0.38.0
 accelerate==0.28.0
 numpy==1.23.5
 tensorflow==2.12.0
