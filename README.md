@@ -79,3 +79,11 @@ step not yet exercised.
 ## License boundary
 MuseTalk is MIT -- no process-isolation *requirement*, but we subprocess it anyway for a clean dep
 boundary. This image redistributes MuseTalk + its model weights under their respective upstream licenses.
+
+## License
+
+This repo is [AGPL-3.0](LICENSE) -- free as in yours: self-host it, learn from it, build on it.
+
+It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream
+licenses (see "License boundary" above). A full third-party license inventory lives in `NOTICE`
+(added before this repo goes public, pending the upstream-license audit).
