@@ -45,37 +45,6 @@ best-effort: a misroute degrades, it doesn't break).
 MuseTalk V1.5 + V1.0 UNet, sd-vae-ft-mse, whisper-tiny, DWPose, face-parse BiSeNet. See
 `download_weights.sh` (adapted from upstream: syncnet dropped, default HF endpoint).
 
-## Phase 0 -- DONE (validated on a live L40S, 2026-06-20)
-MuseTalk runs end-to-end on the cu128/torch2.8 stack: v1.5 inference produced a clean lip-synced clip
-(704x1216, 25fps, h264 + AAC, 8s) from the stock sample. The full proven recipe is baked into the
-Dockerfile. Notably, MuseTalk's own stock sample is a **stylized character** and it lip-syncs cleanly --
-an early yes to "does it handle animation."
-
-The non-obvious things Phase 0 settled (each is a line in the Dockerfile):
-- **No prebuilt mmcv for cu128/torch2.8** (404 on the OpenMMLab index; cu121/torch2.1 is the newest). So
-  mmcv is **built from source** against torch 2.8 -- needs nvcc, which is why the base ships the full CUDA
-  toolkit. mmcv 2.1.0 (matches mmpose 1.3.2 / mmdet 3.2.0).
-- **py3.12 packaging traps:** setuptools 82 dropped `pkg_resources` and old setuptools lacks
-  `pkgutil.ImpImporter` -> pin setuptools 75.6; old sdists (mmcv, xtcocotools) need `--no-build-isolation`.
-- **chumpy** (a transitive mmpose dep, 3D-body-only, unused) is py3.12-broken -> install mmpose/mmdet
-  `--no-deps` and hand-install their real deps.
-- **huggingface_hub must stay <1.0** -- hub 1.x makes `huggingface-cli` a no-op (silent empty download)
-  and breaks transformers 4.39.2.
-- **torch 2.6+ `weights_only=True` default** breaks loading the numpy-pickled checkpoints -> set
-  `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`.
-
-Remaining before ship: build + push the image (Phase 2), stand up the endpoint (Phase 3), wire into the
-control plane (Phase 4), one real shot end-to-end (Phase 5). One caveat: `TORCH_CUDA_ARCH_LIST` is broad
-(sm_80..sm_120) but Phase 0's test build compiled arch 8.9 only, so the broad mmcv build is the single
-step not yet exercised.
-
-## Roadmap / follow-ups
-- **Warm model cache.** Subprocess reloads ~5GB of models per job, wasting warm-worker state. The
-  optimization is an in-process warm cache (the upscale module's `_MODELS` pattern). Deferred until
-  Phase 0 proves the model + dep set.
-- **Upstream face gate.** The control plane should route only dialogue/close shots with a clear face;
-  the module's soft-degrade is the safety net, not the primary gate.
-
 ## License boundary
 MuseTalk is MIT -- no process-isolation *requirement*, but we subprocess it anyway for a clean dep
 boundary. This image redistributes MuseTalk + its model weights under their respective upstream licenses.
