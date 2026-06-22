@@ -51,8 +51,6 @@ boundary. This image redistributes MuseTalk + its model weights under their resp
 
 ## License
 
-This repo is [AGPL-3.0](LICENSE) -- free as in yours: self-host it, learn from it, build on it.
+**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it stays a commons. It is not for sale, and not to be resold as a SaaS.
 
-It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream
-licenses (see "License boundary" above). A full third-party license inventory -- every bundled
-upstream, its source, and its license text -- is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream licenses (see "License boundary" above). A full third-party license inventory -- every bundled upstream, its source, and its license text -- is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
