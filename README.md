@@ -41,6 +41,23 @@ soft-degrade** -- the module passes the original clip through untouched, never a
 detectable face must come back unchanged, not fail the render (so the upstream face gate can be
 best-effort: a misroute degrades, it doesn't break).
 
+## Lip-sync keeps the full clip length (#6)
+
+MuseTalk's output length follows the **audio** track, not the face clip. When a shot's dialogue is
+shorter than the i2v clip (the common case: a 1.4s line over a 5s shot), upstream MuseTalk emits
+only the talking segment and **truncates the shot to the spoken-line length**. In a scatter talking
+film that surfaced as a clip-drop -- a 5s shot came back 1.4s and the assembled film ran short.
+
+The handler fixes this **before** inference (`_pad_audio_to_video` in `handler.py`): it ffprobes the
+face clip and the audio, and if the audio is shorter it pads the audio with **trailing silence
+(`apad -t <clip_seconds>`)** to the face-clip duration. MuseTalk then renders the full clip -- the
+line is spoken at the head, the mouth rests (closed) for the remainder -- so the synced shot keeps
+its **full original length**. The pad is best-effort: if ffprobe/ffmpeg fails it falls back to the
+original audio (never worse than the un-padded behavior).
+
+Net contract: **a lip-synced shot is the same duration as the face clip that went in.** A downstream
+concat/gather can rely on per-shot durations being preserved end to end.
+
 ## Weights (baked, ~5GB, no volume)
 MuseTalk V1.5 + V1.0 UNet, sd-vae-ft-mse, whisper-tiny, DWPose, face-parse BiSeNet. See
 `download_weights.sh` (adapted from upstream: syncnet dropped, default HF endpoint).
