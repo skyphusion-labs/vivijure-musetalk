@@ -75,6 +75,36 @@ def _get(url, dst):
                 f.write(chunk)
 
 
+def _probe_dur(path):
+    """Media duration in seconds (float), or 0.0 if unknown."""
+    try:
+        p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path], capture_output=True, text=True)
+        return float((p.stdout or "").strip() or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _pad_audio_to_video(audio_path, video_path, work):
+    """MuseTalk's output length follows the AUDIO track. When the dialogue is shorter than the face
+    clip, MuseTalk emits only the synced (talking) segment and TRUNCATES the shot to the dialogue
+    length (a 5s i2v shot synced to a 1.4s line came out 1.4s -- the scatter talking-film clip-drop).
+    Pad the audio with trailing silence to the face-clip duration so the synced output keeps the FULL
+    clip length: the line is spoken at the head, the mouth rests for the remainder. Returns the path
+    to feed inference (the original if no pad is needed or the pad fails -- never worse than today)."""
+    adur = _probe_dur(audio_path)
+    vdur = _probe_dur(video_path)
+    if vdur <= 0 or adur <= 0 or adur >= vdur - 0.05:
+        return audio_path
+    padded = os.path.join(work, "audio_padded.wav")
+    try:
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
+                        "-af", "apad", "-t", f"{vdur:.3f}", padded], check=True)
+    except Exception:  # noqa: BLE001 -- pad failure falls back to the original audio
+        return audio_path
+    return padded
+
+
 def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     """Write a temp MuseTalk config (one task: face video + audio), run scripts.inference, and move the
     produced clip to out_path. Output naming varies by version, so we glob the newest mp4 in result_dir."""
@@ -82,6 +112,9 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     unet_path, unet_cfg = UNET[version]
     cfg_dir = tempfile.mkdtemp(prefix="ms-cfg-")
     result_dir = tempfile.mkdtemp(prefix="ms-out-")
+    # Preserve the full clip length: pad a short dialogue track to the face-clip duration so MuseTalk
+    # does not truncate the shot to the spoken-line length (see _pad_audio_to_video).
+    audio_path = _pad_audio_to_video(audio_path, face_path, cfg_dir)
     cfg_path = os.path.join(cfg_dir, "task.yaml")
     task = {"task_0": {"video_path": face_path, "audio_path": audio_path}}
     if bbox_shift:
