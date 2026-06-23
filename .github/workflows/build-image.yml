@@ -10,6 +10,8 @@ on:
       - download_weights.sh
       - requirements.txt
       - .github/workflows/build-image.yml
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -34,14 +36,32 @@ jobs:
           docker image prune -f || true
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="$IMAGE:latest $IMAGE:${GITHUB_SHA}"
+          # A pushed semver tag (refs/tags/v0.1.0) also publishes the bare release tag :0.1.0 --
+          # the immutable versioned image the RunPod endpoint pins to (never :sha, never :latest).
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              VERSION="${GITHUB_REF#refs/tags/v}"
+              TAGS="$TAGS $IMAGE:${VERSION}"
+              ;;
+          esac
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Building tags: $TAGS"
+
       - name: Build image
-        run: docker build -t "$IMAGE:latest" -t "$IMAGE:${GITHUB_SHA}" .
+        run: |
+          ARGS=""
+          for t in ${{ steps.tags.outputs.tags }}; do ARGS="$ARGS -t $t"; done
+          docker build $ARGS .
 
       - name: Push image
         run: |
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:${GITHUB_SHA}"
+          for t in ${{ steps.tags.outputs.tags }}; do docker push "$t"; done
 
       - name: Remove local image to free runner disk
         if: always()
-        run: docker image rm "$IMAGE:latest" "$IMAGE:${GITHUB_SHA}" || true
+        run: |
+          for t in ${{ steps.tags.outputs.tags }}; do docker image rm "$t" || true; done
