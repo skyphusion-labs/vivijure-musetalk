@@ -10,6 +10,52 @@ partner to the upscaler: MuseTalk works a 256x256 face region, so a lip-synced s
 the Real-ESRGAN upscaler ([vivijure-upscale](https://github.com/skyphusion-labs/vivijure-upscale)) to
 return to delivery resolution.
 
+## The Vivijure ecosystem
+
+Vivijure is an AI film studio built as a thin control plane plus opt-in GPU modules. These repos
+form the constellation; this block is identical in each so the whole map is visible from any one of
+them.
+
+```
+   friends + Slate (Discord)
+            |
+            v
+        slate  -->  vivijure (studio control plane / JSON API)
+                        |
+                        v
+                  vivijure-backend (GPU render: keyframes -> i2v -> assemble)
+                        |
+            +-----------+-----------------------------+
+            |           |               |             |
+            v           v               v             v
+     vivijure-     vivijure-       vivijure-      (more finish
+     musetalk      upscale         audio-upscale   modules over time)
+   (lip-sync)    (video upscale)  (speech enhance)
+```
+
+| Repo | Role |
+|---|---|
+| [slate](https://github.com/skyphusion-labs/slate) | Collaborative AI screenwriter assistant for Discord. Friends and Slate co-author a film in-channel; Slate then submits it to the studio entirely through the vivijure JSON API. |
+| [vivijure](https://github.com/skyphusion-labs/vivijure) | The studio control plane (a Cloudflare Worker): planner, cast, and render UI plus the JSON API. A thin module host that orchestrates render jobs behind a typed hook contract. |
+| [vivijure-backend](https://github.com/skyphusion-labs/vivijure-backend) | The GPU render backend (RunPod serverless): SDXL keyframes, Wan image-to-video, and ffmpeg assembly. The half that turns a storyboard bundle into a film. |
+| [vivijure-musetalk](https://github.com/skyphusion-labs/vivijure-musetalk) | MuseTalk audio-driven lip-sync GPU module (finish-class). Syncs a character's mouth to dialogue audio. |
+| [vivijure-upscale](https://github.com/skyphusion-labs/vivijure-upscale) | Real-ESRGAN CUDA video-upscale GPU module (finish-class). Raises the assembled film's resolution. |
+| [vivijure-audio-upscale](https://github.com/skyphusion-labs/vivijure-audio-upscale) | CUDA speech-audio enhancement (resemble-enhance) GPU module. The GPU half of the cost-aware audio finish path. |
+
+## Team
+
+Vivijure is built by Conrad (`skyphusion`) and his named AI crew. The crew are treated as
+individuals, each working in their own lane with their own GitHub identity; this is the same
+transparent framing used across the project.
+
+| Member | Role | GitHub |
+|---|---|---|
+| Conrad | Creator / director | [@skyphusion](https://github.com/skyphusion) |
+| Mackaye | PM / tech lead | [@skyphusion-mackaye](https://github.com/skyphusion-mackaye) |
+| Strummer | Infrastructure | [@skyphusion-strummer](https://github.com/skyphusion-strummer) |
+| Rollins | Backend / modules | [@skyphusion-rollins](https://github.com/skyphusion-rollins) |
+| Joan | Frontend / extraction | [@skyphusion-joan](https://github.com/skyphusion-joan) |
+
 ## How it fits the stack
 Same shape as `vivijure-upscale` -- a single-purpose, baked-weights, scale-to-zero endpoint, **separate**
 from the heavy `vivijure-backend`. The handler drives MuseTalk as a **subprocess**
