@@ -10,7 +10,7 @@ required. None carries a non-commercial restriction.
 
 | Component | Author / Source | License | Notes |
 |---|---|---|---|
-| MuseTalk | TMElyralab -- https://github.com/TMElyralab/MuseTalk | MIT | Cloned at build; driven as a subprocess. Weights baked. |
+| MuseTalk | Tencent Music Entertainment Group (TMElyralab) -- https://github.com/TMElyralab/MuseTalk | MIT | Cloned at build; driven as a subprocess. Weights baked. |
 | sd-vae-ft-mse | Stability AI -- https://huggingface.co/stabilityai/sd-vae-ft-mse | MIT | VAE weights baked. |
 | Whisper (whisper-tiny) | OpenAI -- https://github.com/openai/whisper | MIT | Audio feature weights baked. |
 | DWPose (dw-ll_ucoco_384) | IDEA-Research -- https://github.com/IDEA-Research/DWPose | Apache-2.0 | Pose weights baked. See `licenses/Apache-2.0.txt`. |
@@ -31,7 +31,7 @@ source URL above. Full license texts: AGPL-3.0 -> `LICENSE`; Apache-2.0 ->
 MIT License
 
 Copyright (c) the respective authors of the MIT-licensed components listed above
-(TMElyralab / Stability AI / OpenAI / zllrunning), each retaining its own notice.
+(Tencent Music Entertainment Group (TMElyralab) / Stability AI / OpenAI / zllrunning), each retaining its own notice.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
