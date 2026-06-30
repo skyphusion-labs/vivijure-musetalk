@@ -112,6 +112,13 @@ MuseTalk V1.5 + V1.0 UNet, sd-vae-ft-mse, whisper-tiny, DWPose, face-parse BiSeN
 MuseTalk is MIT -- no process-isolation *requirement*, but we subprocess it anyway for a clean dep
 boundary. This image redistributes MuseTalk + its model weights under their respective upstream licenses.
 
+## Acceptable use
+
+This module animates a face to speech (lip-sync), so it is deepfake-capable. Using it to produce
+non-consensual deepfakes or intimate imagery of a real person, or any sexual content involving minors
+(real or synthetic, which is also illegal under 18 U.S.C. 1466A / 2252A), is absolutely prohibited.
+See the [Vivijure Acceptable Use Policy](https://github.com/skyphusion-labs/vivijure/blob/main/docs/legal/ACCEPTABLE-USE.md).
+
 ## License
 
 **AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it stays a commons. It is not for sale, and not to be resold as a SaaS.
