@@ -1,52 +1,156 @@
 # vivijure-musetalk
 
-A RunPod serverless image that lip-syncs a face video to an audio track with
-[MuseTalk](https://github.com/TMElyralab/MuseTalk) (TMElyralab, **MIT**). The GPU backend for
-Vivijure's `lipsync` module: the finish-class brick that gives the films **talking characters** whose
-mouths match the dialogue.
+**Gives your film's characters mouths that move in time with their spoken lines.** This is the
+lip-sync finish engine for [Vivijure](https://github.com/skyphusion-labs/vivijure), the AI film
+studio. It runs on a GPU (RunPod), takes a face clip and an audio track, and hands back a clip whose
+mouth matches the words. Under the hood it is [MuseTalk](https://github.com/TMElyralab/MuseTalk)
+(TMElyralab, MIT).
 
-It runs **after i2v**, on dialogue / close shots that have a clear face in frame. It is the natural
-partner to the upscaler: MuseTalk works a 256x256 face region, so a lip-synced shot should pass through
-the Real-ESRGAN upscaler ([vivijure-upscale](https://github.com/skyphusion-labs/vivijure-upscale)) to
-return to delivery resolution.
+## Where this fits
 
-## The Vivijure ecosystem
+Vivijure is not one program. It is a small group of programs that work together, called the
+**constellation**. The **Studio** is the center; it tells engines like this one what to do. This map
+is the same in every repo, so you always know where you are.
 
-Vivijure is an AI film studio built as a thin control plane plus opt-in GPU modules. These repos
-form the constellation; this block is identical in each so the whole map is visible from any one of
-them.
+```mermaid
+flowchart TD
+    subgraph front[You and your friends]
+        discord[Discord chat]
+        ui[Studio web page]
+    end
 
+    slate[slate<br/>Discord screenwriter bot]
+
+    subgraph core[The control plane]
+        studio[vivijure Studio<br/>projects, storyboard, cast,<br/>render orchestration + module registry]
+    end
+
+    subgraph modules[Modules: one job each, opt-in]
+        cloudmods[Cloud video modules<br/>Seedance, Kling, Veo, Wan, ...]
+        finishmods[Finish modules<br/>upscale, smooth, lip-sync, titles]
+        audiomods[Audio modules<br/>music, narration]
+    end
+
+    subgraph gpu[The GPU render engines]
+        backend[vivijure-backend<br/>RunPod cloud GPU:<br/>keyframes, image-to-video, LoRA training]
+        local12[vivijure-local-12gb<br/>your own 12GB card LTX]
+        local16[vivijure-local-16gb<br/>your own 16GB card CogVideoX]
+    end
+
+    subgraph finish[Finish helper engines]
+        musetalk[vivijure-musetalk<br/>lip-sync]
+        upscale[vivijure-upscale<br/>video upscale]
+        audioup[vivijure-audio-upscale<br/>audio cleanup]
+    end
+
+    discord --> slate
+    slate --> studio
+    ui --> studio
+    studio --> cloudmods
+    studio --> finishmods
+    studio --> audiomods
+    cloudmods --> backend
+    finishmods --> musetalk
+    finishmods --> upscale
+    audiomods --> audioup
+    studio --> backend
+    studio --> local12
+    studio --> local16
 ```
-   friends + Slate (Discord)
-            |
-            v
-        slate  -->  vivijure (studio control plane / JSON API)
-                        |
-                        v
-                  vivijure-backend (GPU render: keyframes -> i2v -> assemble)
-                        |
-            +-----------+-----------------------------+
-            |           |               |             |
-            v           v               v             v
-     vivijure-     vivijure-       vivijure-      (more finish
-     musetalk      upscale         audio-upscale   modules over time)
-   (lip-sync)    (video upscale)  (speech enhance)
+
+The full map, with a plain-English walk-through, is in [docs/constellation.md](docs/constellation.md).
+
+This engine runs **after** a shot is turned into video, on dialogue and close shots that have a clear
+face in frame. It pairs with the [upscaler](https://github.com/skyphusion-labs/vivijure-upscale):
+MuseTalk works a small face region, so a lip-synced shot is usually upscaled back to full resolution.
+
+## Deploy this finish engine
+
+You need a **RunPod** account (the GPU) and a **registry** to hold the image (like `ghcr.io`). Then:
+
+```bash
+cp deploy.env.example deploy.env   # then open deploy.env and fill in your keys
+./deploy.sh                        # safe to re-run
 ```
 
-| Repo | Role |
+The script builds the image, pushes it to your registry, creates the RunPod endpoint, and prints an
+**endpoint id**. It is idempotent (safe to re-run) and fails closed (stops on the first error). The
+full walk-through, with every setting explained, is in [docs/deploy.md](docs/deploy.md).
+
+**Pin the right GPU.** This image is CUDA 12.8, which needs a new-driver host. Pin it to **Blackwell
+(RTX PRO 6000)** or **Hopper (H100 / H200)** cards. A cheap 4090 or L40S host is a driver lottery for
+this image and can refuse to start.
+
+## Turn it on in the studio
+
+This engine powers the studio's **finish-lipsync** module. Once the endpoint is up:
+
+1. Copy the endpoint id the script printed.
+2. In your studio's `deploy.env`, set **`MUSETALK_RUNPOD_ENDPOINT_ID`** to that id.
+3. Keep `VIVIJURE_PROFILE=full` and re-run the studio's `./deploy.sh`.
+
+See the studio's [docs/opt-in-tiers.md](https://github.com/skyphusion-labs/vivijure/blob/main/docs/opt-in-tiers.md)
+(the "finish-lipsync" entry). It works best with `speech-upscale` on, so the lips follow cleaned
+dialogue.
+
+## The settings (knobs)
+
+Every setting is in `deploy.env`, and each one is explained in full (what it is, why, an example) in
+[docs/deploy.md](docs/deploy.md). In short:
+
+| Setting | What it does |
 |---|---|
-| [slate](https://github.com/skyphusion-labs/slate) | Collaborative AI screenwriter assistant for Discord. Friends and Slate co-author a film in-channel; Slate then submits it to the studio entirely through the vivijure JSON API. |
-| [vivijure](https://github.com/skyphusion-labs/vivijure) | The studio control plane (a Cloudflare Worker): planner, cast, and render UI plus the JSON API. A thin module host that orchestrates render jobs behind a typed hook contract. |
-| [vivijure-backend](https://github.com/skyphusion-labs/vivijure-backend) | The GPU render backend (RunPod serverless): SDXL keyframes, Wan image-to-video, and ffmpeg assembly. The half that turns a storyboard bundle into a film. |
-| [vivijure-musetalk](https://github.com/skyphusion-labs/vivijure-musetalk) | MuseTalk audio-driven lip-sync GPU module (finish-class). Syncs a character's mouth to dialogue audio. |
-| [vivijure-upscale](https://github.com/skyphusion-labs/vivijure-upscale) | Real-ESRGAN CUDA video-upscale GPU module (finish-class). Raises the assembled film's resolution. |
-| [vivijure-audio-upscale](https://github.com/skyphusion-labs/vivijure-audio-upscale) | CUDA speech-audio enhancement (resemble-enhance) GPU module. The GPU half of the cost-aware audio finish path. |
+| `RUNPOD_API_KEY` | Your RunPod key, so the script can make the endpoint. |
+| `IMAGE` | The image name to build, push, and run (point it at your own registry). |
+| `ENDPOINT_NAME` | A label for the endpoint (re-runs reuse it by this name). |
+| `GPU_TYPE_IDS` | Which GPU cards to pin (Blackwell or Hopper for this cu128 image). |
+| `CONTAINER_DISK_GB` | Disk for the container (default 30; MuseTalk bakes ~7GB of weights). |
+| `WORKERS_MIN` / `WORKERS_MAX` | Scaling bounds; min 0 = scale to zero = pay nothing when idle. |
+| `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
+| `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
 
-## Team
+Two per-job knobs the studio can pass: **`bbox_shift`** (default 0; nudges the mouth box up or down)
+and **`version`** (default `v15`; the MuseTalk model version).
 
-Vivijure is built by Conrad (`skyphusion`) and his named AI crew. The crew are treated as
-individuals, each working in their own lane with their own GitHub identity; this is the same
-transparent framing used across the project.
+## The job contract
+
+Three modes, so you know exactly what the endpoint does. It is the only finish engine with **two**
+inputs (a face clip and an audio track).
+
+- **R2 finish-chain mode:** `{ "clip_key": "...", "audio_key": "...", "output_key": "...",
+  "bbox_shift": 0, "version": "v15" }`.
+- **Presigned mode:** `{ "video_url": "...", "audio_url": "...", "output_url": "...",
+  "output_key": "..." }`.
+- **Self-test:** `{ "selftest": true }` runs MuseTalk end to end on a baked sample face and speech, and
+  doubles as a health check.
+
+Returns `{ ok, clip_key|output_key, bytes, version, applied: ["lipsync:v15"] }`. A shot with no clear
+face comes back unchanged instead of failing, so a misrouted shot never breaks your film.
+
+**Length is preserved.** MuseTalk follows the audio length, so a short line over a long shot would cut
+the shot short. The handler pads the audio with trailing silence to the clip length first, so a
+lip-synced shot keeps the **same duration** as the face clip that went in. A downstream stitch can rely
+on per-shot durations staying the same end to end.
+
+## How it runs
+
+The handler drives MuseTalk as a **subprocess** (`python -m scripts.inference`), so this code never
+imports MuseTalk's internals; MuseTalk's dependency tree stays isolated behind a clean process
+boundary. The weights (MuseTalk V1.5 and V1.0 UNet, sd-vae-ft-mse, whisper-tiny, DWPose, face-parse
+BiSeNet, about 7GB) are **baked into the image**, so a cold worker never downloads them. See
+`download_weights.sh`.
+
+## Acceptable use
+
+This module animates a face to speech (lip-sync), so it is deepfake-capable. Using it to produce
+non-consensual deepfakes or intimate imagery of a real person, or any sexual content involving minors
+(real or synthetic, which is also illegal under 18 U.S.C. 1466A / 2252A), is absolutely prohibited.
+See the [Vivijure Acceptable Use Policy](https://github.com/skyphusion-labs/vivijure/blob/main/docs/legal/ACCEPTABLE-USE.md).
+
+## The team
+
+Vivijure is built by Conrad (`skyphusion`) and his named AI crew, each working in their own lane with
+their own GitHub identity.
 
 | Member | Role | GitHub |
 |---|---|---|
@@ -56,71 +160,11 @@ transparent framing used across the project.
 | Rollins | Backend / modules | [@skyphusion-rollins](https://github.com/skyphusion-rollins) |
 | Joan | Frontend / extraction | [@skyphusion-joan](https://github.com/skyphusion-joan) |
 
-## How it fits the stack
-Same shape as `vivijure-upscale` -- a single-purpose, baked-weights, scale-to-zero endpoint, **separate**
-from the heavy `vivijure-backend`. The handler drives MuseTalk as a **subprocess**
-(`python -m scripts.inference`), exactly like the upscale module subprocesses ffmpeg/video2x, so this
-code never imports MuseTalk's internals (clean process boundary; MuseTalk's dep tree stays isolated).
-
-## Handler contract (job input)
-Three modes, identical in spirit to the rest of the module stack. The one difference vs a one-video
-module: **two inputs**, a face clip AND an audio track.
-
-**R2 finish-chain mode** (the endpoint reads/writes the shared bucket):
-```json
-{
-  "clip_key":   "renders/<project>/clips/<shot>.mp4",
-  "audio_key":  "renders/<project>/audio/<shot>.wav",
-  "output_key": "renders/<project>/clips/<shot>_ls.mp4",
-  "bbox_shift": 0,
-  "version":    "v15"
-}
-```
-**Presigned mode** (credentialless -- the core presigns R2): `{ video_url, audio_url, output_url, output_key }`.
-
-**Selftest:** `{ "selftest": true }` runs MuseTalk end to end on its **own baked sample** (a real face +
-speech -- a synthetic testsrc has no face to detect), confirming CUDA + the full UNet/VAE/whisper +
-dwpose/face-parse stack. Doubles as the endpoint health check.
-
-Returns `{ ok, clip_key|output_key, bytes, version, applied:["lipsync:v15"] }`. **A non-ok result is a
-soft-degrade** -- the module passes the original clip through untouched, never a drop. A shot with no
-detectable face must come back unchanged, not fail the render (so the upstream face gate can be
-best-effort: a misroute degrades, it doesn't break).
-
-## Lip-sync keeps the full clip length (#6)
-
-MuseTalk's output length follows the **audio** track, not the face clip. When a shot's dialogue is
-shorter than the i2v clip (the common case: a 1.4s line over a 5s shot), upstream MuseTalk emits
-only the talking segment and **truncates the shot to the spoken-line length**. In a scatter talking
-film that surfaced as a clip-drop -- a 5s shot came back 1.4s and the assembled film ran short.
-
-The handler fixes this **before** inference (`_pad_audio_to_video` in `handler.py`): it ffprobes the
-face clip and the audio, and if the audio is shorter it pads the audio with **trailing silence
-(`apad -t <clip_seconds>`)** to the face-clip duration. MuseTalk then renders the full clip -- the
-line is spoken at the head, the mouth rests (closed) for the remainder -- so the synced shot keeps
-its **full original length**. The pad is best-effort: if ffprobe/ffmpeg fails it falls back to the
-original audio (never worse than the un-padded behavior).
-
-Net contract: **a lip-synced shot is the same duration as the face clip that went in.** A downstream
-concat/gather can rely on per-shot durations being preserved end to end.
-
-## Weights (baked, ~5GB, no volume)
-MuseTalk V1.5 + V1.0 UNet, sd-vae-ft-mse, whisper-tiny, DWPose, face-parse BiSeNet. See
-`download_weights.sh` (adapted from upstream: syncnet dropped, default HF endpoint).
-
-## License boundary
-MuseTalk is MIT -- no process-isolation *requirement*, but we subprocess it anyway for a clean dep
-boundary. This image redistributes MuseTalk + its model weights under their respective upstream licenses.
-
-## Acceptable use
-
-This module animates a face to speech (lip-sync), so it is deepfake-capable. Using it to produce
-non-consensual deepfakes or intimate imagery of a real person, or any sexual content involving minors
-(real or synthetic, which is also illegal under 18 U.S.C. 1466A / 2252A), is absolutely prohibited.
-See the [Vivijure Acceptable Use Policy](https://github.com/skyphusion-labs/vivijure/blob/main/docs/legal/ACCEPTABLE-USE.md).
-
 ## License
 
-**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it stays a commons. It is not for sale, and not to be resold as a SaaS.
+**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own
+creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it
+stays a commons. It is not for sale, and not to be resold as a SaaS.
 
-It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream licenses (see "License boundary" above). A full third-party license inventory -- every bundled upstream, its source, and its license text -- is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream
+licenses. A full third-party license inventory is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
