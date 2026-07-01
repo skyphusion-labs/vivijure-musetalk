@@ -168,3 +168,5 @@ stays a commons. It is not for sale, and not to be resold as a SaaS.
 
 It redistributes **MuseTalk** (MIT, TMElyralab) and its model weights under their respective upstream
 licenses. A full third-party license inventory is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Licensed under AGPL-3.0-only. See [LICENSE](LICENSE).
