@@ -175,6 +175,18 @@ def _selftest(inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _key_error(key, what, prefixes=("renders/",)):
+    """Validate a job-supplied R2 key against the render key map BEFORE any bucket I/O. Every key
+    this module reads or writes lives inside the studio's render tree (see the module docstring),
+    so an absolute key, a `..` segment, a backslash, or an out-of-prefix key is a malformed job.
+    Refused as data (this handler reports errors, it does not raise): returns the error string,
+    or None when the key is fine."""
+    k = str(key or "")
+    ok = (bool(k) and k == k.strip() and not k.startswith("/") and "\\" not in k
+          and ".." not in k.split("/") and k.startswith(tuple(prefixes)))
+    return None if ok else f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+
+
 def _lipsync_r2(inp):
     """R2 mode: download clip_key + audio_key, lip-sync, upload output_key in the shared bucket; return
     the new key as `clip_key` so the finish chain carries the lip-synced clip downstream."""
@@ -182,9 +194,17 @@ def _lipsync_r2(inp):
     audio_key = inp.get("audio_key")
     if not audio_key:
         return {"ok": False, "error": "lipsync needs both clip_key and audio_key"}
+    err = (_key_error(clip_key, "clip_key")
+           # dialogue tracks live under renders/; a staged bed lives under audio/ -- both in-map
+           or _key_error(audio_key, "audio_key", prefixes=("renders/", "audio/")))
+    if err:
+        return {"ok": False, "error": err}
     name = clip_key.rsplit("/", 1)[-1]
     output_key = inp.get("output_key") or (
         f"{clip_key.rsplit('.', 1)[0]}_ls.{clip_key.rsplit('.', 1)[1]}" if "." in name else f"{clip_key}_ls")
+    err = _key_error(output_key, "output_key")
+    if err:
+        return {"ok": False, "error": err}
     bbox_shift = int(inp.get("bbox_shift", 0) or 0)
     version = str(inp.get("version", "v15"))
     if not (R2_ENDPOINT and os.environ.get("R2_ACCESS_KEY_ID")):
