@@ -7,16 +7,20 @@ shots that have a clear face in frame.
 Same transport contract + {"selftest": true} harness as the rest of the module stack (mirrors
 vivijure-upscale). The one real difference: TWO inputs (a face clip AND an audio track) instead of one.
 
-We drive MuseTalk as a SUBPROCESS (`python -m scripts.inference` against a temp config yaml), the same
-way the upscale module subprocesses ffmpeg/video2x -- so this handler never imports MuseTalk's internals
-(clean process boundary; MuseTalk's deps stay isolated from ours).
+We drive MuseTalk IN-PROCESS: the ~5GB model set (vae/unet/pe + whisper + face-parse) is loaded once
+per warm RunPod worker and cached (the upscale module's `_MODELS` pattern), then every job reuses it.
+This replaced the old `python -m scripts.inference` subprocess, which reloaded all ~5GB from disk onto
+the GPU on every single job and discarded the warm state (GPU-billed seconds burned per job). MuseTalk's
+inference helpers (`load_all_model`, `AudioProcessor`, `FaceParsing`, `datagen`, `get_image`, ...) are the
+same public surface its own CLI (`scripts.inference`) drives; we import them lazily inside `_pipeline`, so
+a missing/broken MuseTalk checkout surfaces as a job error (honest soft-degrade), not a worker-boot crash.
 
 Job input (R2 finish-chain mode -- the endpoint reads/writes the shared bucket itself):
   {
     "clip_key":   "renders/<project>/clips/<shot>.mp4",      # required -- the face video
     "audio_key":  "renders/<project>/audio/<shot>.wav",      # required -- the dialogue to sync to
     "output_key": "renders/<project>/clips/<shot>_ls.mp4",   # optional -- defaults to <clip>_ls.mp4
-    "bbox_shift": 0,          # optional MuseTalk mouth-region tuning (+ opens / - closes the crop)
+    "bbox_shift": 0,          # optional MuseTalk mouth-region tuning (+ opens / - closes the crop; v1 only)
     "version":    "v15"       # v15 (default, best) | v1
   }
 
@@ -27,12 +31,9 @@ Returns: { ok, clip_key|output_key, bytes, version, applied:["lipsync:<ver>"] } 
 { ok: false, error } otherwise. A non-ok result is a SOFT-DEGRADE -- the lipsync module passes the
 original clip through untouched, never a drop (a shot with no detectable face must come back unchanged,
 not fail the render).
-
-PERF FOLLOW-UP (post Phase 0): subprocess reloads ~5GB of models per job, throwing away warm-worker
-state. The optimization is to import MuseTalk's model-load once into a warm cache (the upscale module's
-`_MODELS` pattern) and call inference in-process. Deferred until Phase 0 proves the model + the dep set.
 """
 
+import copy
 import glob
 import os
 import shutil
@@ -40,16 +41,25 @@ import subprocess
 import tempfile
 
 import boto3
+import numpy as np
 import requests
 import runpod
 import torch
-import yaml
 
 MUSETALK_DIR = os.environ.get("MUSETALK_DIR", "/app/MuseTalk")
+WHISPER_DIR = os.path.join(MUSETALK_DIR, "models", "whisper")
 DOWNLOAD_TIMEOUT = 900
 UPLOAD_TIMEOUT = 900
 
-# UNet weights, relative to MUSETALK_DIR (scripts.inference runs with cwd=MUSETALK_DIR).
+# Inference constants pinned to MuseTalk's scripts.inference CLI defaults (so in-process output matches
+# what the old subprocess produced): batch 8, extra face margin 10, jaw parsing, 2/2 audio padding.
+BATCH_SIZE = 8
+EXTRA_MARGIN = 10
+PARSING_MODE = "jaw"
+AUDIO_PAD_LEFT = 2
+AUDIO_PAD_RIGHT = 2
+
+# UNet weights, relative to MUSETALK_DIR (inference runs with cwd=MUSETALK_DIR).
 UNET = {
     "v15": ("models/musetalkV15/unet.pth", "models/musetalkV15/musetalk.json"),
     "v1": ("models/musetalk/pytorch_model.bin", "models/musetalk/musetalk.json"),
@@ -57,6 +67,10 @@ UNET = {
 
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT_URL", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "vivijure")
+
+# Warm-worker model cache: version -> loaded pipeline dict. The ~5GB load happens once per worker; every
+# subsequent job on that worker reuses it. Keyed by version because the face-parse config differs (v15).
+_PIPE = {}
 
 
 def _r2():
@@ -105,41 +119,143 @@ def _pad_audio_to_video(audio_path, video_path, work):
     return padded
 
 
-def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
-    """Write a temp MuseTalk config (one task: face video + audio), run scripts.inference, and move the
-    produced clip to out_path. Output naming varies by version, so we glob the newest mp4 in result_dir."""
+def _pipeline(version):
+    """Load MuseTalk's models ONCE per worker and cache them (the ~5GB warm state). Imports MuseTalk's
+    internals lazily so an import failure is a job error, not a boot crash. Returns the cached dict."""
     version = version if version in UNET else "v15"
+    if version in _PIPE:
+        return _PIPE[version]
+    from transformers import WhisperModel
+
+    from musetalk.utils.audio_processor import AudioProcessor
+    from musetalk.utils.face_parsing import FaceParsing
+    from musetalk.utils.utils import load_all_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     unet_path, unet_cfg = UNET[version]
-    cfg_dir = tempfile.mkdtemp(prefix="ms-cfg-")
-    result_dir = tempfile.mkdtemp(prefix="ms-out-")
-    # Preserve the full clip length: pad a short dialogue track to the face-clip duration so MuseTalk
-    # does not truncate the shot to the spoken-line length (see _pad_audio_to_video).
-    audio_path = _pad_audio_to_video(audio_path, face_path, cfg_dir)
-    cfg_path = os.path.join(cfg_dir, "task.yaml")
-    task = {"task_0": {"video_path": face_path, "audio_path": audio_path}}
-    if bbox_shift:
-        task["task_0"]["bbox_shift"] = int(bbox_shift)
-    with open(cfg_path, "w") as f:
-        yaml.safe_dump(task, f)
-    cmd = ["python3", "-m", "scripts.inference",
-           "--inference_config", cfg_path,
-           "--result_dir", result_dir,
-           "--unet_model_path", unet_path,
-           "--unet_config", unet_cfg,
-           "--version", version]
+    vae, unet, pe = load_all_model(
+        unet_model_path=unet_path, vae_type="sd-vae", unet_config=unet_cfg, device=device)
+    pe = pe.to(device)
+    vae.vae = vae.vae.to(device)
+    unet.model = unet.model.to(device)
+    weight_dtype = unet.model.dtype
+    audio_processor = AudioProcessor(feature_extractor_path=WHISPER_DIR)
+    whisper = WhisperModel.from_pretrained(WHISPER_DIR).to(device=device, dtype=weight_dtype).eval()
+    whisper.requires_grad_(False)
+    # v15 takes explicit cheek widths (the CLI defaults); v1 takes none.
+    fp = FaceParsing(left_cheek_width=90, right_cheek_width=90) if version == "v15" else FaceParsing()
+    _PIPE[version] = {
+        "device": device, "vae": vae, "unet": unet, "pe": pe,
+        "timesteps": torch.tensor([0], device=device), "weight_dtype": weight_dtype,
+        "audio_processor": audio_processor, "whisper": whisper, "fp": fp,
+    }
+    return _PIPE[version]
+
+
+def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
+    """Lip-sync one face clip against one audio track IN-PROCESS against the warm model cache, and write
+    the muxed result to out_path. This mirrors scripts.inference's per-task loop exactly (frame extract ->
+    whisper features -> landmark/crop latents -> batched UNet -> blend -> encode + mux), minus the
+    per-job model reload. Same signature the callers already use; raises on failure (callers turn a raise
+    into an honest soft-degrade)."""
+    import cv2
+
+    from musetalk.utils.blending import get_image
+    from musetalk.utils.preprocessing import coord_placeholder, get_landmark_and_bbox
+    from musetalk.utils.utils import datagen, get_video_fps
+
+    version = version if version in UNET else "v15"
+    p = _pipeline(version)
+    device, vae, unet, pe = p["device"], p["vae"], p["unet"], p["pe"]
+    timesteps, weight_dtype = p["timesteps"], p["weight_dtype"]
+    audio_processor, whisper, fp = p["audio_processor"], p["whisper"], p["fp"]
+    # v15 uses a fixed bbox_shift of 0; only v1 honours the job-supplied tuning.
+    bshift = 0 if version == "v15" else int(bbox_shift or 0)
+
+    work = tempfile.mkdtemp(prefix="ms-infer-")
+    frames_dir = os.path.join(work, "frames")
+    out_frames_dir = os.path.join(work, "out_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(out_frames_dir, exist_ok=True)
     try:
-        p = subprocess.run(cmd, cwd=MUSETALK_DIR, capture_output=True, text=True)
-        if p.returncode != 0:
-            raise RuntimeError(f"musetalk inference rc={p.returncode}: {(p.stderr or p.stdout or '')[-800:]}")
-        mp4s = sorted(glob.glob(os.path.join(result_dir, "**", "*.mp4"), recursive=True),
-                      key=os.path.getmtime)
-        if not mp4s:
+        # Pad a short dialogue track to the face-clip duration so MuseTalk keeps the full clip length.
+        audio_path = _pad_audio_to_video(audio_path, face_path, work)
+
+        # Extract source frames.
+        subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
+                        os.path.join(frames_dir, "%08d.png")], check=True)
+        input_img_list = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+        if not input_img_list:
+            raise RuntimeError("no frames extracted from face clip")
+        fps = get_video_fps(face_path)
+
+        # Whisper audio features.
+        with torch.no_grad():
+            feats, librosa_length = audio_processor.get_audio_feature(audio_path)
+            whisper_chunks = audio_processor.get_whisper_chunk(
+                feats, device, weight_dtype, whisper, librosa_length, fps=fps,
+                audio_padding_length_left=AUDIO_PAD_LEFT, audio_padding_length_right=AUDIO_PAD_RIGHT)
+
+            # Landmark + crop each frame to a UNet latent.
+            coord_list, frame_list = get_landmark_and_bbox(input_img_list, bshift)
+            input_latent_list = []
+            for bbox, frame in zip(coord_list, frame_list):
+                if bbox == coord_placeholder:
+                    continue
+                x1, y1, x2, y2 = bbox
+                if version == "v15":
+                    y2 = min(y2 + EXTRA_MARGIN, frame.shape[0])
+                crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                input_latent_list.append(vae.get_latents_for_unet(crop))
+            if not input_latent_list:
+                raise RuntimeError("no face detected in clip")
+
+            # Cycle padding so the first/last frames transition smoothly.
+            frame_list_cycle = frame_list + frame_list[::-1]
+            coord_list_cycle = coord_list + coord_list[::-1]
+            input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+
+            # Batched UNet inference over the whisper chunks.
+            res_frame_list = []
+            gen = datagen(whisper_chunks=whisper_chunks, vae_encode_latents=input_latent_list_cycle,
+                          batch_size=BATCH_SIZE, delay_frame=0, device=device)
+            for whisper_batch, latent_batch in gen:
+                audio_feature_batch = pe(whisper_batch)
+                latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                pred_latents = unet.model(
+                    latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                for res_frame in vae.decode_latents(pred_latents):
+                    res_frame_list.append(res_frame)
+
+        # Blend each generated mouth back into its source frame.
+        for i, res_frame in enumerate(res_frame_list):
+            bbox = coord_list_cycle[i % len(coord_list_cycle)]
+            ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
+            x1, y1, x2, y2 = bbox
+            if version == "v15":
+                y2 = min(y2 + EXTRA_MARGIN, ori_frame.shape[0])
+            try:
+                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+            except Exception:  # noqa: BLE001 -- a degenerate bbox drops that frame, as upstream does
+                continue
+            if version == "v15":
+                combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=PARSING_MODE, fp=fp)
+            else:
+                combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+            cv2.imwrite(os.path.join(out_frames_dir, f"{str(i).zfill(8)}.png"), combine)
+
+        # Encode the blended frames, then mux the audio back in.
+        temp_vid = os.path.join(work, "temp.mp4")
+        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
+                        "-i", os.path.join(out_frames_dir, "%08d.png"),
+                        "-vcodec", "libx264", "-vf", "format=yuv420p", "-crf", "18", temp_vid], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", audio_path, "-i", temp_vid, out_path],
+                       check=True)
+        if not os.path.exists(out_path) or not os.path.getsize(out_path):
             raise RuntimeError("musetalk produced no output mp4")
-        shutil.move(mp4s[-1], out_path)
         return out_path
     finally:
-        shutil.rmtree(cfg_dir, ignore_errors=True)
-        shutil.rmtree(result_dir, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _selftest(inp):
