@@ -1,23 +1,17 @@
 name: build-image
 
-# Build the vivijure-musetalk RunPod serverless image and push it to GHCR.
+# Build + push the vivijure-musetalk CONSUMER image (the thin half of the 2-image split): the default
+# Dockerfile is `FROM base-<N>@digest` + `COPY handler.py`, so this build pulls the digest-pinned base
+# and re-pushes ONLY the handler layer -- every base layer dedups on GHCR. The expensive base (cu128
+# stack + openmmlab build + ~7.3GB weights) is built SEPARATELY + deliberately by base-build.yml
+# (dispatch-only); this workflow never rebuilds it.
 #
-# Unified image workflow (mirrors the slate image.yml shape): a pushed SemVer tag
-# (v0.1.0) publishes the immutable, pinnable release image tagged with the clean
-# version (0.1.0), the major.minor (0.1), and the short commit sha (sha-abc1234).
-# There is NO :latest -- a RunPod endpoint template pins an explicit :version so a
-# re-provision is deterministic (re-pinning the endpoint is a separate, deliberate,
-# spend-gated step). A push to main that touches the image inputs still builds and
-# pushes a sha-tagged image as a build smoke; workflow_dispatch allows a manual
-# rebuild of any ref.
+# Runner: GitHub-hosted ubuntu-latest (public repo, fork-safe). The base pull (~17GB) still needs the
+# disk-reclaim step below (ubuntu-latest ships ~14GB free), but no weights are re-staged here.
 #
-# Runner: GitHub-hosted ubuntu-latest. This repo is PUBLIC, so per the standing runner
-# policy (public repos -> GitHub-hosted, fork-safe; private/internal -> the org fleet
-# pool) the build runs in the hosted sandbox, NOT on the self-hosted fleet. The CUDA
-# base (runpod/pytorch cu1281) is a tens-of-GB build; ubuntu-latest ships with only
-# ~14GB free, so the "Free disk space" step below reclaims ~25-30GB of preinstalled
-# toolchains this image never uses (the same pattern proven in vivijure-backend). Without
-# it the docker build blows the runner disk.
+# A pushed SemVer tag (v0.1.0) publishes the immutable :0.1.0 release image a RunPod endpoint pins to
+# (never :sha, never :latest). A push to main touching the consumer inputs builds a :sha smoke;
+# workflow_dispatch rebuilds any ref.
 
 on:
   workflow_dispatch:
@@ -26,11 +20,9 @@ on:
     paths:
       - Dockerfile
       - handler.py
-      - download_weights.sh
-      - requirements.txt
       - .github/workflows/build-image.yml
     tags:
-      - "v*.*.*"
+      - "v*"
 
 permissions:
   contents: read
@@ -38,7 +30,7 @@ permissions:
 
 concurrency:
   group: build-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -50,7 +42,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space (CUDA image needs more than the ~14GB hosted default)
+      - name: Free disk space (the digest-pinned base pull needs more than the ~14GB hosted default)
         run: |
           set -eu
           echo "--- before ---"; df -h /
@@ -64,26 +56,32 @@ jobs:
           echo "--- after ---"; df -h /
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Derive image tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="$IMAGE:latest $IMAGE:${GITHUB_SHA}"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              VERSION="${GITHUB_REF#refs/tags/v}"
+              TAGS="$TAGS $IMAGE:${VERSION}"
+              ;;
+          esac
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Building tags: $TAGS"
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Build consumer image (FROM the digest-pinned base + COPY handler)
+        run: |
+          ARGS=""
+          for t in ${{ steps.tags.outputs.tags }}; do ARGS="$ARGS -t $t"; done
+          docker build $ARGS .
+
+      - name: Push image
+        run: |
+          for t in ${{ steps.tags.outputs.tags }}; do docker push "$t"; done
+
+      - name: Remove local image to free runner disk
+        if: always()
+        run: |
+          for t in ${{ steps.tags.outputs.tags }}; do docker image rm "$t" || true; done
