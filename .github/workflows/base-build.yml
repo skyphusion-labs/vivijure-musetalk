@@ -1,0 +1,80 @@
+name: base-build
+
+# Build the vivijure-musetalk BASE image (the stable, expensive half of the 2-image split): cu128 base
+# + source-compiled openmmlab stack + MuseTalk checkout + ~7.3GB baked weights. Published as a
+# SAME-PACKAGE tag ghcr.io/skyphusion-labs/vivijure-musetalk:base-<N> (never a separate package --
+# same-package FROM-layer dedup keeps the consumer push handler-layer-only, the S19 hard-won fact).
+#
+# DISPATCH-ONLY and DELIBERATE: rebuilt only on a dep/weight change (a new base-<N>); the consumer
+# Dockerfile then repins its FROM ...@sha256 digest to the printed value. It is NOT wired to push/tag
+# triggers, so a routine commit can never silently re-bake the base and un-pin the consumer.
+#
+# Runner: GitHub-hosted ubuntu-latest (public repo, fork-safe). The ~17GB image needs the disk-reclaim
+# step (ubuntu-latest ships ~14GB free). ~35min when it runs, which is rare.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Base image tag; bump on a deliberate dep/weight rebuild (base-1, base-2, ...)"
+        required: true
+        default: "base-1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: base-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      IMAGE: ghcr.io/skyphusion-labs/vivijure-musetalk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (CUDA base + ~7.3GB weights need more than the ~14GB hosted default)
+        run: |
+          set -eu
+          echo "--- before ---"; df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build base image
+        run: docker build -f base.Dockerfile -t "$IMAGE:${{ inputs.base_tag }}" .
+
+      - name: Push base image
+        run: docker push "$IMAGE:${{ inputs.base_tag }}"
+
+      - name: Print pinnable digest (repin the consumer Dockerfile FROM to this)
+        run: |
+          RAW=$(docker inspect --format="{{index .RepoDigests 0}}" "$IMAGE:${{ inputs.base_tag }}")
+          SHA=${RAW#*@}
+          REF="$IMAGE:${{ inputs.base_tag }}@$SHA"
+          echo "Base image published. Repin the consumer Dockerfile FROM to:"
+          echo "  FROM $REF"
+          {
+            echo "## vivijure-musetalk base image published"
+            echo ""
+            echo "Repin the consumer Dockerfile FROM to:"
+            echo ""
+            echo "    FROM $REF"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove local image to free runner disk
+        if: always()
+        run: docker image rm "$IMAGE:${{ inputs.base_tag }}" || true
