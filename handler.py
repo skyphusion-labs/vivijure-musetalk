@@ -224,8 +224,16 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
                 feats, device, weight_dtype, whisper, librosa_length, fps=fps,
                 audio_padding_length_left=AUDIO_PAD_LEFT, audio_padding_length_right=AUDIO_PAD_RIGHT)
 
-            # Landmark + crop each frame to a UNet latent.
-            coord_list, frame_list = get_landmark_and_bbox(input_img_list, bshift)
+            # Landmark + crop each frame to a UNet latent. get_landmark_and_bbox prints a bbox_shift
+            # hint that AVERAGES over the DETECTED faces (int(sum(average_range_*) / len(average_range_*)));
+            # a clip with ZERO detections across every frame leaves those lists empty, so MuseTalk itself
+            # raises ZeroDivisionError before it returns. That is the plainest no-face case (scenery that
+            # does not even fool the detector, e.g. narration over a landscape) -- an honest soft-degrade,
+            # not a crash. Catch ONLY that division; any other error still propagates as a genuine failure.
+            try:
+                coord_list, frame_list = get_landmark_and_bbox(input_img_list, bshift)
+            except ZeroDivisionError:
+                raise SoftDegrade("no face detected in clip") from None
             input_latent_list = []
             for bbox, frame in zip(coord_list, frame_list):
                 if bbox == coord_placeholder:
