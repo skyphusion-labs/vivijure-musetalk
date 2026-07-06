@@ -100,3 +100,18 @@ def test_presigned_crash_keeps_error_key(monkeypatch):
     out = handler._lipsync_presigned(dict(PRESIGNED_JOB))
     assert out["ok"] is False
     assert "error" in out and "detail" not in out
+
+
+def test_ensure_musetalk_path_inserts_at_front():
+    # The in-process handler must put the MuseTalk checkout on sys.path (defect #27). Verify the helper
+    # front-inserts MUSETALK_DIR (priority) and is idempotent (no duplicate on re-import).
+    saved = list(sys.path)
+    try:
+        sys.path[:] = [p for p in sys.path if p != handler.MUSETALK_DIR]
+        assert handler.MUSETALK_DIR not in sys.path
+        handler._ensure_musetalk_path()
+        assert sys.path[0] == handler.MUSETALK_DIR
+        handler._ensure_musetalk_path()
+        assert sys.path.count(handler.MUSETALK_DIR) == 1
+    finally:
+        sys.path[:] = saved
