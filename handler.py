@@ -296,8 +296,13 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         subprocess.run(["ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
                         "-i", os.path.join(out_frames_dir, "%08d.png"),
                         "-vcodec", "libx264", "-vf", "format=yuv420p", "-crf", "18", temp_vid], check=True)
-        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", audio_path, "-i", temp_vid, out_path],
-                       check=True)
+        # Mux the audio into the CRF-18 video WITHOUT re-encoding the video (-c:v copy). ffmpeg
+        # re-encodes by default, and with no codec given it would re-run libx264 at its default
+        # (~CRF 23, roughly 2 Mbps at 48fps 720p), silently discarding the CRF-18 first pass above
+        # and starving the mouth region MuseTalk just generated (the breathy look an anime 2x upscale
+        # then magnifies -- vivijure #584). Stream-copy the video; only the audio is encoded here.
+        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", audio_path, "-i", temp_vid,
+                        "-c:v", "copy", out_path], check=True)
         if not os.path.exists(out_path) or not os.path.getsize(out_path):
             # Inference ran but assembled no usable output (detection too sparse / gapped to mux the
             # %08d.png sequence): an honest no-usable-face soft-degrade, not a hard crash. A genuine
