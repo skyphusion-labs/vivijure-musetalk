@@ -27,10 +27,12 @@ Job input (R2 finish-chain mode -- the endpoint reads/writes the shared bucket i
 Job input (presigned mode -- credentialless handler, the core presigns R2):
   { "video_url": "<GET clip>", "audio_url": "<GET audio>", "output_url": "<PUT result>", "output_key": "..." }
 
-Returns: { ok, clip_key|output_key, bytes, version, applied:["lipsync:<ver>"] } on success;
-{ ok: false, error } otherwise. A non-ok result is a SOFT-DEGRADE -- the lipsync module passes the
-original clip through untouched, never a drop (a shot with no detectable face must come back unchanged,
-not fail the render).
+Returns: { ok, clip_key|output_key, bytes, version, applied:["lipsync:<ver>"] } on success. A shot
+that genuinely cannot be lip-synced (no detectable face) is an HONEST SOFT-DEGRADE: the job COMPLETES
+with { ok: false, detail } (note: `detail`, NOT `error` -- RunPod lifts a top-level `error` key to job
+status FAILED, which would fail the whole film), and the lipsync module passes the ORIGINAL clip
+through untouched. A GENUINE crash returns { ok: false, error } and lands FAILED so the render fails
+loud (vivijure #245).
 """
 
 import copy
@@ -71,6 +73,15 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "vivijure")
 # Warm-worker model cache: version -> loaded pipeline dict. The ~5GB load happens once per worker; every
 # subsequent job on that worker reuses it. Keyed by version because the face-parse config differs (v15).
 _PIPE = {}
+
+
+class SoftDegrade(Exception):
+    """An honest no-op outcome: the clip genuinely cannot be lip-synced (no detectable face), so the
+    module must pass the ORIGINAL clip through unchanged rather than fail the render. The caller turns
+    this into a COMPLETED job with {"ok": false, "detail": ...} and NO top-level `error` key, because
+    RunPod lifts a top-level `error` to job status FAILED (which would fail the whole film). A GENUINE
+    crash is NOT a SoftDegrade: it keeps returning `error` / raising, so the job lands FAILED and the
+    render fails loud (vivijure #245)."""
 
 
 def _r2():
@@ -156,8 +167,9 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     """Lip-sync one face clip against one audio track IN-PROCESS against the warm model cache, and write
     the muxed result to out_path. This mirrors scripts.inference's per-task loop exactly (frame extract ->
     whisper features -> landmark/crop latents -> batched UNet -> blend -> encode + mux), minus the
-    per-job model reload. Same signature the callers already use; raises on failure (callers turn a raise
-    into an honest soft-degrade)."""
+    per-job model reload. Same signature the callers already use; raises SoftDegrade for a no-face clip
+    (callers COMPLETE the job as an honest passthrough) and other exceptions for genuine failures
+    (callers return those as FAILED)."""
     import cv2
 
     from musetalk.utils.blending import get_image
@@ -208,7 +220,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
                 crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256), interpolation=cv2.INTER_LANCZOS4)
                 input_latent_list.append(vae.get_latents_for_unet(crop))
             if not input_latent_list:
-                raise RuntimeError("no face detected in clip")
+                raise SoftDegrade("no face detected in clip")
 
             # Cycle padding so the first/last frames transition smoothly.
             frame_list_cycle = frame_list + frame_list[::-1]
@@ -227,7 +239,10 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
                 for res_frame in vae.decode_latents(pred_latents):
                     res_frame_list.append(res_frame)
 
-        # Blend each generated mouth back into its source frame.
+        # Blend each generated mouth back into its source frame. `written` counts frames that landed
+        # on a real face bbox: a placeholder / degenerate bbox (a false-positive detection on a faceless
+        # clip, e.g. a lighthouse) resizes to a zero area and is dropped here, exactly as upstream does.
+        written = 0
         for i, res_frame in enumerate(res_frame_list):
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
@@ -243,6 +258,14 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
             else:
                 combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
             cv2.imwrite(os.path.join(out_frames_dir, f"{str(i).zfill(8)}.png"), combine)
+            written += 1
+
+        # No blended frame landed on a usable face region: the detector false-positived on a faceless
+        # clip (input_latent_list was not empty, so the guard above did not fire) but every candidate
+        # bbox was a placeholder / degenerate. Honest no-face soft-degrade (a superset of the
+        # empty-latent guard), not the confusing post-mux "produced no output mp4".
+        if not written:
+            raise SoftDegrade("no face detected in clip")
 
         # Encode the blended frames, then mux the audio back in.
         temp_vid = os.path.join(work, "temp.mp4")
@@ -252,7 +275,10 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", audio_path, "-i", temp_vid, out_path],
                        check=True)
         if not os.path.exists(out_path) or not os.path.getsize(out_path):
-            raise RuntimeError("musetalk produced no output mp4")
+            # Inference ran but assembled no usable output (detection too sparse / gapped to mux the
+            # %08d.png sequence): an honest no-usable-face soft-degrade, not a hard crash. A genuine
+            # ffmpeg failure raises CalledProcessError above (check=True) and stays a FAILED render.
+            raise SoftDegrade("no usable face region in clip (produced no lip-synced output)")
         return out_path
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -339,7 +365,11 @@ def _lipsync_r2(inp):
         s3.upload_file(dst, R2_BUCKET, output_key, ExtraArgs={"ContentType": "video/mp4"})
         return {"ok": True, "clip_key": output_key, "bytes": os.path.getsize(dst),
                 "version": version, "applied": [f"lipsync:{version}"]}
-    except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
+    except SoftDegrade as e:
+        # Honest no-face passthrough: COMPLETES the job ({"ok": false, "detail": ...}, no top-level
+        # `error`) so the lipsync module ships the ORIGINAL clip unchanged instead of failing the film.
+        return {"ok": False, "detail": str(e)[:500]}
+    except Exception as e:  # noqa: BLE001 -- a genuine crash keeps the `error` key -> job FAILED
         return {"ok": False, "error": str(e)[:500]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -373,7 +403,11 @@ def _lipsync_presigned(inp):
         put.raise_for_status()
         return {"ok": True, "output_key": output_key, "bytes": size,
                 "version": version, "applied": [f"lipsync:{version}"]}
-    except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
+    except SoftDegrade as e:
+        # Honest no-face passthrough: COMPLETES the job ({"ok": false, "detail": ...}, no top-level
+        # `error`) so the lipsync module ships the ORIGINAL clip unchanged instead of failing the film.
+        return {"ok": False, "detail": str(e)[:500]}
+    except Exception as e:  # noqa: BLE001 -- a genuine crash keeps the `error` key -> job FAILED
         return {"ok": False, "error": str(e)[:500]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
