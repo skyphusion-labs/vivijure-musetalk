@@ -11,9 +11,12 @@ are STUBBED here; the routing under test is pure control flow and the tests monk
 _run_musetalk / _get / _r2, so none of the stubs are exercised.
 """
 
+import contextlib
 import os
 import sys
 import types
+
+import pytest
 
 
 def _stub(name, **attrs):
@@ -115,3 +118,71 @@ def test_ensure_musetalk_path_inserts_at_front():
         assert sys.path.count(handler.MUSETALK_DIR) == 1
     finally:
         sys.path[:] = saved
+
+
+def _fake_musetalk_raising_zerodiv(monkeypatch):
+    """Inject a fake `musetalk` package tree whose get_landmark_and_bbox raises ZeroDivisionError
+    (MuseTalk's own 0/0 bbox-shift-hint average over zero detections), plus the other lazy imports
+    _run_musetalk pulls. Registered via monkeypatch so pytest unwinds them after the test."""
+    def _zdiv(*a, **k):
+        raise ZeroDivisionError("division by zero")
+
+    mt = types.ModuleType("musetalk")
+    utils = types.ModuleType("musetalk.utils")
+    blending = types.ModuleType("musetalk.utils.blending")
+    blending.get_image = lambda *a, **k: None
+    pre = types.ModuleType("musetalk.utils.preprocessing")
+    pre.coord_placeholder = (0.0, 0.0, 0.0, 0.0)
+    pre.get_landmark_and_bbox = _zdiv
+    u = types.ModuleType("musetalk.utils.utils")
+    u.datagen = lambda *a, **k: iter(())
+    u.get_video_fps = lambda *a, **k: 25
+    mt.utils = utils
+    utils.blending = blending
+    utils.preprocessing = pre
+    utils.utils = u
+    for name, mod in [
+        ("musetalk", mt), ("musetalk.utils", utils), ("musetalk.utils.blending", blending),
+        ("musetalk.utils.preprocessing", pre), ("musetalk.utils.utils", u), ("cv2", types.ModuleType("cv2")),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_zero_detection_detection_raises_softdegrade(monkeypatch, tmp_path):
+    # A ZERO-detection clip makes MuseTalk`s get_landmark_and_bbox raise ZeroDivisionError before it
+    # returns; _run_musetalk must convert THAT into a SoftDegrade (honest no-face), which the caller
+    # then routes to {ok:false, detail} with NO top-level error. Drive _run_musetalk to the detection
+    # call with everything upstream stubbed (GPU-free).
+    _fake_musetalk_raising_zerodiv(monkeypatch)
+    monkeypatch.setattr(sys.modules["torch"], "no_grad", lambda: contextlib.nullcontext(), raising=False)
+    monkeypatch.setattr(handler, "_pad_audio_to_video", lambda a, v, w: a)
+    monkeypatch.setattr(handler, "_pipeline", lambda version: {
+        "device": None, "vae": None, "unet": None, "pe": None, "timesteps": None, "weight_dtype": None,
+        "whisper": None, "fp": None,
+        "audio_processor": types.SimpleNamespace(
+            get_audio_feature=lambda path: (None, 0),
+            get_whisper_chunk=lambda *a, **k: []),
+    })
+
+    def _fake_run(cmd, *a, **k):
+        # the frame-extract ffmpeg writes %08d.png into frames_dir; drop one so the extract check passes
+        for tok in cmd:
+            if isinstance(tok, str) and tok.endswith("%08d.png"):
+                open(tok.replace("%08d", "00000000"), "wb").close()
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(handler.subprocess, "run", _fake_run)
+
+    with pytest.raises(handler.SoftDegrade):
+        handler._run_musetalk(str(tmp_path / "face.mp4"), str(tmp_path / "audio.wav"),
+                              str(tmp_path / "out.mp4"), version="v15")
+
+
+def test_zero_detection_routes_to_detail_not_error(monkeypatch):
+    # End-to-end envelope: _run_musetalk raising SoftDegrade (the zero-detection outcome above) makes the
+    # presigned caller COMPLETE the job as {ok:false, detail}, NO top-level error.
+    monkeypatch.setattr(handler, "_get", _touch)
+    monkeypatch.setattr(handler, "_run_musetalk", _raise_no_face)
+    out = handler._lipsync_presigned(dict(PRESIGNED_JOB))
+    assert out["ok"] is False
+    assert "detail" in out and "error" not in out
