@@ -46,11 +46,26 @@ import handler  # noqa: E402
 
 
 class _FakeS3:
+    def __init__(self):
+        self.uploaded = []
+        self.puts = []          # (Key, Body) for put_object -- captures the .hash sidecar
+        self.order = []         # write order, to assert artifact-first / sidecar-last
+
     def download_file(self, bucket, key, dst):
         open(dst, "wb").close()
 
-    def upload_file(self, *a, **k):
-        pass
+    def upload_file(self, src, bucket, key, **k):
+        self.uploaded.append(key)
+        self.order.append(("artifact", key))
+
+    def put_object(self, Bucket=None, Key=None, Body=None, **k):
+        self.puts.append((Key, Body))
+        self.order.append(("sidecar", Key))
+
+
+def _run_ok(face, audio, out, **k):
+    with open(out, "wb") as f:
+        f.write(b"video-bytes")
 
 
 def _touch(url, dst):
@@ -186,3 +201,57 @@ def test_zero_detection_routes_to_detail_not_error(monkeypatch):
     out = handler._lipsync_presigned(dict(PRESIGNED_JOB))
     assert out["ok"] is False
     assert "detail" in out and "error" not in out
+
+
+# --- #583 provenance sidecar -------------------------------------------------------------------
+
+def test_r2_stamps_sidecar_after_artifact_when_output_hash_present(monkeypatch):
+    s3 = _FakeS3()
+    monkeypatch.setattr(handler, "_r2", lambda: s3)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_r2({**R2_JOB, "output_key": "renders/p/clips/s_ls.mp4", "output_hash": "deadbeef"})
+    assert out["ok"] is True
+    # sidecar written to <output_key>.hash with the hash VERBATIM
+    assert s3.puts == [("renders/p/clips/s_ls.mp4.hash", b"deadbeef")]
+    # artifact FIRST, sidecar LAST (the only safe order)
+    assert [kind for kind, _ in s3.order] == ["artifact", "sidecar"]
+
+
+def test_r2_writes_no_sidecar_without_output_hash(monkeypatch):
+    s3 = _FakeS3()
+    monkeypatch.setattr(handler, "_r2", lambda: s3)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_r2({**R2_JOB, "output_key": "renders/p/clips/s_ls.mp4"})
+    assert out["ok"] is True
+    assert s3.puts == []  # legacy core (no output_hash) -> no sidecar, safe re-run at the gate
+
+
+def test_r2_sidecar_write_failure_never_fails_the_render(monkeypatch):
+    class _S3Boom(_FakeS3):
+        def put_object(self, **k):
+            raise RuntimeError("r2 down")
+    s3 = _S3Boom()
+    monkeypatch.setattr(handler, "_r2", lambda: s3)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_r2({**R2_JOB, "output_key": "renders/p/clips/s_ls.mp4", "output_hash": "deadbeef"})
+    assert out["ok"] is True and "error" not in out  # artifact is up; a sidecar miss is best-effort
+
+
+def test_presigned_stamps_sidecar_only_when_hash_url_provided(monkeypatch):
+    puts = []
+    class _Resp:
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(handler, "_get", _touch)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    def _fake_put(url, data=None, **k):
+        puts.append((url, data))
+        return _Resp()
+    monkeypatch.setattr(handler.requests, "put", _fake_put, raising=False)
+    # with hash_url -> sidecar PUT happens (artifact PUT + sidecar PUT = 2)
+    handler._lipsync_presigned({**PRESIGNED_JOB, "output_hash": "deadbeef", "hash_url": "https://hash.put"})
+    assert ("https://hash.put", b"deadbeef") in puts
+    # without hash_url -> no sidecar PUT (only the artifact PUT)
+    puts.clear()
+    handler._lipsync_presigned({**PRESIGNED_JOB, "output_hash": "deadbeef"})
+    assert all(url != "https://hash.put" for url, _ in puts)

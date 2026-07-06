@@ -124,6 +124,13 @@ inputs (a face clip and an audio track).
 - **Self-test:** `{ "selftest": true }` runs MuseTalk end to end on a baked sample face and speech, and
   doubles as a health check.
 
+Both modes also accept an optional **`output_hash`** (a 64-char hex string the studio computes over the
+step's inputs, #583). When present, the handler writes it VERBATIM to `<output_key>.hash` AFTER the
+artifact (artifact first, sidecar last), as the studio's reuse-provenance stamp. The value is opaque here
+(never parsed or recomputed); absent `output_hash` -> no sidecar. In presigned mode the sidecar is written
+only if a presigned `hash_url` is also supplied. A sidecar write is best-effort: a failure never fails the
+render (a missing stamp just makes the studio re-run the step next time).
+
 Returns `{ ok, clip_key|output_key, bytes, version, applied: ["lipsync:v15"] }`. A shot with no clear
 face comes back unchanged instead of failing, so a misrouted shot never breaks your film.
 
