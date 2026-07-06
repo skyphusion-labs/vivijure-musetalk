@@ -40,6 +40,7 @@ import glob
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import boto3
@@ -50,6 +51,21 @@ import torch
 
 MUSETALK_DIR = os.environ.get("MUSETALK_DIR", "/app/MuseTalk")
 WHISPER_DIR = os.path.join(MUSETALK_DIR, "models", "whisper")
+
+
+def _ensure_musetalk_path():
+    """Put the MuseTalk source checkout on sys.path so the in-process `import musetalk` resolves.
+
+    MuseTalk is a git CHECKOUT baked at MUSETALK_DIR (base.Dockerfile), NOT a pip-installed package, and
+    this handler drives it IN-PROCESS. The image launches `python /app/handler.py`, which puts the SCRIPT
+    dir (/app) on sys.path[0], NOT the cwd (/app/MuseTalk); nothing else adds it (no PYTHONPATH in the
+    image env, no chdir here). Without this the lazy `import musetalk` fails with ModuleNotFoundError
+    (#27). Front-insert for priority; idempotent so a re-import does not duplicate the entry."""
+    if MUSETALK_DIR not in sys.path:
+        sys.path.insert(0, MUSETALK_DIR)
+
+
+_ensure_musetalk_path()
 DOWNLOAD_TIMEOUT = 900
 UPLOAD_TIMEOUT = 900
 
