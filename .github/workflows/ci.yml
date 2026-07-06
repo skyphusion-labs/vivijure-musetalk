@@ -1,11 +1,13 @@
 name: ci
 
-# Minimal CI gate for this thin RunPod finish-module wrapper. There is nothing CPU-testable to cover:
-# the handler is a single wrapper whose heavy GPU/ML deps (torch, boto3, runpod, ...) import only on the
-# card, so coverage would be fabricated. Instead this is a REAL error gate -- ruff catches syntax (E9)
-# and pyflakes errors (F: undefined names, unused imports), py_compile catches parse breaks. Style noise
-# (line length, quotes) is intentionally NOT selected so the gate is signal, not a nitpick wall.
-# Public repo -> GitHub-hosted ubuntu-latest (fork-safe), never the fleet pool.
+# Minimal CI gate for this thin RunPod finish-module wrapper. The heavy GPU/ML deps (torch, boto3,
+# runpod, ...) import only on the card, so the GPU pipeline itself is not CPU-testable and coverage of
+# it would be fabricated. Two real gates run here: (1) ruff catches syntax (E9) and pyflakes errors
+# (F: undefined names, unused imports) + py_compile catches parse breaks; (2) pytest covers the pure
+# control flow that IS testable off the card -- the SoftDegrade envelope contract (a no-face soft-degrade
+# COMPLETES with `detail` / NO top-level `error`; a genuine crash keeps `error` -> job FAILED), with the
+# heavy deps stubbed. Style noise (line length, quotes) is intentionally NOT selected so the gate is
+# signal, not a nitpick wall. Public repo -> GitHub-hosted ubuntu-latest (fork-safe), never the fleet pool.
 
 on:
   push:
@@ -28,9 +30,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install ruff (pinned for a deterministic gate)
-        run: pip install ruff==0.15.20
+      - name: Install the gate tools (pinned for a deterministic run)
+        run: pip install ruff==0.15.20 pytest==9.1.1
       - name: Lint (real errors only -- E9 syntax + F pyflakes)
         run: ruff check --select E9,F .
       - name: Syntax-compile the handler
         run: python -m py_compile handler.py
+      - name: Unit tests (SoftDegrade envelope routing; heavy deps stubbed, no GPU)
+        run: python -m pytest -q tests/
