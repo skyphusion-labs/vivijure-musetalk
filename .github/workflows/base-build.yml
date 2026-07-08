@@ -36,7 +36,7 @@ jobs:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-musetalk
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Free disk space (CUDA base + ~7.3GB weights need more than the ~14GB hosted default)
         run: |
