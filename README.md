@@ -167,6 +167,12 @@ their own GitHub identity.
 | Rollins | Backend / modules | [@skyphusion-rollins](https://github.com/skyphusion-rollins) |
 | Joan | Frontend / extraction | [@skyphusion-joan](https://github.com/skyphusion-joan) |
 
+## Who this is for
+
+Vivijure operators wiring **lip-sync finish** on RunPod GPU (MuseTalk talking heads for dialogue shots).
+
+**Vivijure Studio:** https://vivijure.com · **Skyphusion Labs:** https://skyphusion.org
+
 ## Support
 
 Questions, bugs, or ideas? Start with this repo's [GitHub Issues](../../issues); see
