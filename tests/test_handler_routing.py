@@ -120,6 +120,30 @@ def test_presigned_crash_keeps_error_key(monkeypatch):
     assert "error" in out and "detail" not in out
 
 
+def _raise_too_short(*a, **k):
+    # #702: the too-short honesty guard fires when the face was undetectable for most of the clip.
+    raise handler.SoftDegrade("lip-sync kept only 3/65 frames (face undetectable for most of the clip)")
+
+
+def test_r2_too_short_completes_with_detail(monkeypatch):
+    # A truncated lip-sync (#702) is an HONEST soft-degrade, not a crash: the job COMPLETES with detail so
+    # the module ships the ORIGINAL clip, exactly like the no-face path -- never a top-level `error`.
+    monkeypatch.setattr(handler, "_r2", lambda: _FakeS3())
+    monkeypatch.setattr(handler, "_run_musetalk", _raise_too_short)
+    out = handler._lipsync_r2(dict(R2_JOB))
+    assert out["ok"] is False
+    assert "detail" in out and "error" not in out
+    assert "kept only" in out["detail"]
+
+
+def test_presigned_too_short_completes_with_detail(monkeypatch):
+    monkeypatch.setattr(handler, "_get", _touch)
+    monkeypatch.setattr(handler, "_run_musetalk", _raise_too_short)
+    out = handler._lipsync_presigned(dict(PRESIGNED_JOB))
+    assert out["ok"] is False
+    assert "detail" in out and "error" not in out
+
+
 def test_ensure_musetalk_path_inserts_at_front():
     # The in-process handler must put the MuseTalk checkout on sys.path (defect #27). Verify the helper
     # front-inserts MUSETALK_DIR (priority) and is idempotent (no duplicate on re-import).
@@ -255,3 +279,62 @@ def test_presigned_stamps_sidecar_only_when_hash_url_provided(monkeypatch):
     puts.clear()
     handler._lipsync_presigned({**PRESIGNED_JOB, "output_hash": "deadbeef"})
     assert all(url != "https://hash.put" for url, _ in puts)
+
+
+
+# --- #702: the deterministic lip-sync truncation guards (pure, GPU-free) -------------------------------
+# Night_Shift shot_01 shipped a 3-of-65-frame clip (0.17s for a 4s shot), deterministically, whenever an
+# early source frame had no detectable face. Root cause: blended output PNGs were named by the source LOOP
+# INDEX, so a dropped (degenerate-bbox) frame left a %08d hole; ffmpeg`s image2 reader stops at the first
+# missing index, truncating the clip to its first unbroken run. These cover the two pure guards that fix it.
+
+def _emit_names_like_the_loop(keep_flags):
+    """Reproduce the blend loop`s output-naming for a sequence of keep/drop decisions, using the FIXED
+    contiguous counter. A dropped frame (keep=False) is `continue`d exactly as the loop does."""
+    names = []
+    written = 0
+    for keep in keep_flags:
+        if not keep:
+            continue
+        names.append(handler._blended_frame_name(written))
+        written += 1
+    return names
+
+
+def test_frame_names_are_contiguous_even_when_frames_drop():
+    # Frame index 3 drops (no face) -- the historical shot_01 signature.
+    names = _emit_names_like_the_loop([True, True, True, False, True, True])
+    assert names == ["00000000.png", "00000001.png", "00000002.png", "00000003.png", "00000004.png"]
+    indices = [int(n.split(".")[0]) for n in names]
+    assert indices == list(range(len(indices)))  # no hole -> ffmpeg reads every emitted frame
+
+
+def test_old_loop_index_scheme_would_have_gapped():
+    # Regression guard: naming by the loop index i reintroduces the hole ffmpeg truncates on.
+    keep = [True, True, True, False, True, True]
+    old_scheme = [f"{i:08d}.png" for i, k in enumerate(keep) if k]
+    assert "00000003.png" not in old_scheme  # gap at 3 -> ffmpeg stops after 00000002.png (3 frames)
+    assert old_scheme != _emit_names_like_the_loop(keep)
+
+
+def test_no_drops_is_a_full_contiguous_sequence():
+    names = _emit_names_like_the_loop([True] * 64)
+    assert len(names) == 64 and names[-1] == "00000063.png"
+
+
+def test_too_short_trips_on_the_shot_01_case():
+    assert handler._lipsync_too_short(3, 65) is True     # 3 of 65 -> degrade to the original clip
+
+
+def test_too_short_passes_full_and_transient_misses():
+    assert handler._lipsync_too_short(64, 65) is False   # full-length sync
+    assert handler._lipsync_too_short(60, 65) is False   # 92% kept -- a few transient misses
+
+
+def test_too_short_floor_is_inclusive():
+    assert handler._lipsync_too_short(50, 100) is False   # exactly 50% is trusted
+    assert handler._lipsync_too_short(49, 100) is True    # strictly below degrades
+
+
+def test_too_short_never_trips_on_zero_expected():
+    assert handler._lipsync_too_short(0, 0) is False

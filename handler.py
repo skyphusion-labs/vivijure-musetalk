@@ -77,6 +77,13 @@ PARSING_MODE = "jaw"
 AUDIO_PAD_LEFT = 2
 AUDIO_PAD_RIGHT = 2
 
+# #702: minimum fraction of the audio-driven frames a lip-sync must actually emit before we trust it.
+# Below this the face was undetectable for most of the clip, so the "synced" output is a stutter far
+# shorter than its audio (shot_01 once shipped 3 of 65 frames -> 0.17s). We SoftDegrade to the ORIGINAL
+# clip -- honest, full-length, un-synced -- rather than a truncated lie. Mirrors the studio duration gate
+# floor (vivijure #697).
+LIPSYNC_MIN_FRAME_RATIO = 0.5
+
 # UNet weights, relative to MUSETALK_DIR (inference runs with cwd=MUSETALK_DIR).
 UNET = {
     "v15": ("models/musetalkV15/unet.pth", "models/musetalkV15/musetalk.json"),
@@ -177,6 +184,22 @@ def _pipeline(version):
         "audio_processor": audio_processor, "whisper": whisper, "fp": fp,
     }
     return _PIPE[version]
+
+
+def _blended_frame_name(written):
+    """CONTIGUOUS %08d filename for the blended-frame sequence. ffmpeg`s image2 reader stops at the first
+    MISSING index, so an emitted frame MUST be numbered by how many frames we have WRITTEN so far, never by
+    the source-loop index: a dropped (no-face / degenerate-bbox) frame must not punch a hole that silently
+    truncates the whole encode to its first unbroken run. That hole deterministically cut Night_Shift
+    shot_01 to 3 of 65 frames whenever an early frame had no detectable face (vivijure #702)."""
+    return f"{written:08d}.png"
+
+
+def _lipsync_too_short(written, expected, ratio=LIPSYNC_MIN_FRAME_RATIO):
+    """True when a lip-sync emitted materially fewer frames than its audio drove -- the face was
+    undetectable for most of the clip, so the output is a stutter far shorter than the dialogue. `written`
+    = frames actually blended + encoded; `expected` = the audio-driven frame count (vivijure #702)."""
+    return expected > 0 and written < expected * ratio
 
 
 def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
@@ -281,7 +304,10 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
                 combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=PARSING_MODE, fp=fp)
             else:
                 combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
-            cv2.imwrite(os.path.join(out_frames_dir, f"{str(i).zfill(8)}.png"), combine)
+            # #702: number by frames WRITTEN, not the loop index i. A dropped frame above must not leave
+            # a %08d gap -- the image2 encoder below stops at the first missing index, which
+            # deterministically truncated shot_01 to 3 of 65 frames (0.17s) on any early no-face frame.
+            cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), combine)
             written += 1
 
         # No blended frame landed on a usable face region: the detector false-positived on a faceless
@@ -290,6 +316,14 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         # empty-latent guard), not the confusing post-mux "produced no output mp4".
         if not written:
             raise SoftDegrade("no face detected in clip")
+        # #702: the face was detectable for too little of the clip -- the emitted sequence is a stutter far
+        # shorter than the audio. Ship the ORIGINAL clip (honest soft-degrade, the lipsync module passes it
+        # through), never a truncated lip-sync that the studio duration gate then rejects.
+        expected_frames = len(res_frame_list)
+        if _lipsync_too_short(written, expected_frames):
+            raise SoftDegrade(
+                f"lip-sync kept only {written}/{expected_frames} frames "
+                "(face undetectable for most of the clip)")
 
         # Encode the blended frames, then mux the audio back in.
         temp_vid = os.path.join(work, "temp.mp4")
