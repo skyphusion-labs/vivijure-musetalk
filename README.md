@@ -131,8 +131,11 @@ artifact (artifact first, sidecar last), as the studio's reuse-provenance stamp.
 only if a presigned `hash_url` is also supplied. A sidecar write is best-effort: a failure never fails the
 render (a missing stamp just makes the studio re-run the step next time).
 
-Returns `{ ok, clip_key|output_key, bytes, version, applied: ["lipsync:v15"] }`. A shot with no clear
-face comes back unchanged instead of failing, so a misrouted shot never breaks your film.
+Returns `{ ok, clip_key|output_key, bytes, version, applied: ["lipsync:v15"] }`. A shot with no
+clear face, or one where a face is detectable in fewer than half its frames, comes back unchanged at
+full length instead of failing (an honest soft-degrade, never a truncated clip), so a misrouted or
+mostly-faceless shot never breaks your film. The lip-synced output is numbered contiguously, so a
+single dropped no-face frame can no longer cut the clip short (vivijure #702).
 
 **Length is preserved.** MuseTalk follows the audio length, so a short line over a long shot would cut
 the shot short. The handler pads the audio with trailing silence to the clip length first, so a
