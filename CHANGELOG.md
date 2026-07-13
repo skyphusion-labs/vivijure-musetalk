@@ -3,6 +3,14 @@
 The image ships as a git-tag-driven release (`v<X.Y.Z>`; see `RELEASES.md`). Each tag builds the
 consumer image. This file records the why behind each release; the tag is the version of record.
 
+## v1.0.0
+
+- **First stable release of the MuseTalk lip-sync finish module.** The lip-sync satellite in the
+  Vivijure constellation, output-verified end-to-end for Studio v1.0.0 (finish-lipsync: the MuseTalk
+  `_ls` artifact is produced and the mouth articulates across the spoken line). No handler change since
+  v0.1.5; cut to the stable v1.0.0 line as part of the constellation-wide milestone. The `v1.0.0` tag
+  builds the consumer image.
+
 ## v0.1.5
 
 - **fix(handler): frame-gap truncation -- contiguous output numbering + honest lip-sync floor (#26,
