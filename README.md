@@ -174,7 +174,7 @@ their own GitHub identity.
 
 Vivijure operators wiring **lip-sync finish** on RunPod GPU (MuseTalk talking heads for dialogue shots).
 
-**Vivijure Studio:** https://vivijure.com · **Skyphusion Labs:** https://skyphusion.org
+**Vivijure Studio:** https://vivijure.com · **Live demo:** https://demo.vivijure.com · **Skyphusion Labs:** https://skyphusion.org
 
 ## Support
 
