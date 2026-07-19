@@ -9,10 +9,11 @@ name: build-image
 # Runner: GitHub-hosted ubuntu-latest (public repo, fork-safe). The base pull (~17GB) still needs the
 # disk-reclaim step below (ubuntu-latest ships ~14GB free), but no weights are re-staged here.
 #
-# A pushed SemVer tag (v0.1.0) publishes the immutable :0.1.0 release image a RunPod endpoint pins to.
-# A push to main touching the consumer inputs BUILDS the image as a smoke but does NOT push it; only a
-# pushed version tag (or a manual workflow_dispatch) publishes to GHCR. A bare merge to main never
-# publishes.
+# A pushed SemVer tag (v0.1.0) publishes the immutable :0.1.0 release image a RunPod endpoint pins to
+# (never :latest, never a full-sha tag -- matches vivijure-upscale / vivijure-audio-upscale doctrine;
+# see #47). Trace tag is :sha-<short>. A push to main touching the consumer inputs BUILDS the image
+# as a smoke but does NOT push it; only a pushed version tag (or a manual workflow_dispatch) publishes
+# to GHCR. A bare merge to main never publishes.
 
 on:
   workflow_dispatch:
@@ -63,11 +64,16 @@ jobs:
       - name: Compute tags
         id: tags
         run: |
-          TAGS="$IMAGE:latest $IMAGE:${GITHUB_SHA}"
+          # Pinnable-only: :X.Y.Z on a release tag, plus a short :sha-<short> trace.
+          # No :latest (nothing pins it; siblings forbid it). No full-sha tags (#47).
+          SHORT="sha-${GITHUB_SHA::7}"
           case "${GITHUB_REF}" in
             refs/tags/v*)
               VERSION="${GITHUB_REF#refs/tags/v}"
-              TAGS="$TAGS $IMAGE:${VERSION}"
+              TAGS="$IMAGE:${VERSION} $IMAGE:${SHORT}"
+              ;;
+            *)
+              TAGS="$IMAGE:${SHORT}"
               ;;
           esac
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
