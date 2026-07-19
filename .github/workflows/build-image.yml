@@ -9,9 +9,10 @@ name: build-image
 # Runner: GitHub-hosted ubuntu-latest (public repo, fork-safe). The base pull (~17GB) still needs the
 # disk-reclaim step below (ubuntu-latest ships ~14GB free), but no weights are re-staged here.
 #
-# A pushed SemVer tag (v0.1.0) publishes the immutable :0.1.0 release image a RunPod endpoint pins to
-# (never :sha, never :latest). A push to main touching the consumer inputs builds a :sha smoke;
-# workflow_dispatch rebuilds any ref.
+# A pushed SemVer tag (v0.1.0) publishes the immutable :0.1.0 release image a RunPod endpoint pins to.
+# A push to main touching the consumer inputs BUILDS the image as a smoke but does NOT push it; only a
+# pushed version tag (or a manual workflow_dispatch) publishes to GHCR. A bare merge to main never
+# publishes.
 
 on:
   workflow_dispatch:
@@ -56,6 +57,7 @@ jobs:
           echo "--- after ---"; df -h /
 
       - name: Log in to GHCR
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Compute tags
@@ -78,6 +80,9 @@ jobs:
           docker build $ARGS .
 
       - name: Push image
+        # Publish ONLY on a version tag or a deliberate workflow_dispatch; a bare
+        # merge to main builds the image above as a smoke but never pushes it.
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         run: |
           for t in ${{ steps.tags.outputs.tags }}; do docker push "$t"; done
 
