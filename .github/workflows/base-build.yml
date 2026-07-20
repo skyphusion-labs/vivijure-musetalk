@@ -9,8 +9,8 @@ name: base-build
 # Dockerfile then repins its FROM ...@sha256 digest to the printed value. It is NOT wired to push/tag
 # triggers, so a routine commit can never silently re-bake the base and un-pin the consumer.
 #
-# Runner: GitHub-hosted ubuntu-latest (public repo, fork-safe). The ~17GB image needs the disk-reclaim
-# step (ubuntu-latest ships ~14GB free). ~35min when it runs, which is rare.
+# Runner: Plane C `[self-hosted, gpu]` (vivijure-gpu-builds; fc#754). Disk-reclaim stays
+# hosted-only (propagandhi has TB-class free space).
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   base:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gpu]
     timeout-minutes: 240
     env:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-musetalk
@@ -38,7 +38,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Free disk space (CUDA base + ~7.3GB weights need more than the ~14GB hosted default)
+      - name: Free disk space (hosted runners only)
+        if: runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "--- before ---"; df -h /
@@ -48,7 +49,7 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo rm -rf /usr/local/share/boost || true
           sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune -af || true
+          docker image prune -af || true
           echo "--- after ---"; df -h /
 
       - name: Log in to GHCR
