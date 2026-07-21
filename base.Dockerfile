@@ -60,7 +60,7 @@ RUN pip install --no-cache-dir "mmengine>=0.10" && \
 
 # MuseTalk inference deps. huggingface_hub PINNED <1.0 -- hub 1.x makes huggingface-cli a no-op AND
 # breaks transformers 4.39.2 (which requires hub <1.0). tensorflow/gradio dropped (unused at inference).
-RUN pip install --no-cache-dir --ignore-installed cryptography \
+RUN pip install --no-cache-dir \
       diffusers==0.30.2 accelerate==0.28.0 transformers==4.39.2 "huggingface_hub==0.25.2" \
       omegaconf librosa soundfile opencv-python einops "imageio[ffmpeg]" ffmpeg-python moviepy gdown \
       runpod boto3 pyyaml
