@@ -8,3 +8,6 @@ results/
 
 # local deploy secrets (never commit)
 deploy.env
+
+# Python virtualenv (local dev)
+.venv/
