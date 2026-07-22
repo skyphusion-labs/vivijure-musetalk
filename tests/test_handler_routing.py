@@ -82,7 +82,11 @@ def _raise_crash(*a, **k):
     raise RuntimeError("cuda oom")
 
 
-R2_JOB = {"clip_key": "renders/p/clips/s.mp4", "audio_key": "renders/p/audio/s.wav"}
+R2_JOB = {
+    "project": "p",
+    "clip_key": "renders/p/clips/s.mp4",
+    "audio_key": "renders/p/audio/s.wav",
+}
 # Public https URLs; getaddrinfo is monkeypatched in tests that hit _url_error.
 PRESIGNED_JOB = {
     "video_url": "https://bucket.example/v",
@@ -396,3 +400,31 @@ def test_presigned_rejects_bad_url_before_get(monkeypatch):
     })
     assert out["ok"] is False and "error" in out
     assert called["get"] == 0
+
+
+def test_r2_rejects_cross_project_before_io(monkeypatch):
+    class Boom:
+        def download_file(self, *a, **k):
+            raise AssertionError("must not touch R2 for rejected keys")
+
+        def upload_file(self, *a, **k):
+            raise AssertionError("must not touch R2 for rejected keys")
+
+    monkeypatch.setattr(handler, "_r2", lambda: Boom())
+    out = handler._lipsync_r2({
+        "project": "attacker",
+        "clip_key": "renders/victim/clips/s.mp4",
+        "audio_key": "renders/victim/audio/s.wav",
+    })
+    assert out["ok"] is False
+    assert "must be under renders/attacker/" in out["error"]
+
+
+def test_r2_rejects_missing_project(monkeypatch):
+    monkeypatch.setattr(handler, "_r2", lambda: None)
+    out = handler._lipsync_r2({
+        "clip_key": "renders/p/clips/s.mp4",
+        "audio_key": "renders/p/audio/s.wav",
+    })
+    assert out["ok"] is False
+    assert "project is required" in out["error"]
