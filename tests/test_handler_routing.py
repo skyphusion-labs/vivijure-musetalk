@@ -428,3 +428,20 @@ def test_r2_rejects_missing_project(monkeypatch):
     })
     assert out["ok"] is False
     assert "project is required" in out["error"]
+
+
+def test_r2_rejects_flat_audio_prefix(monkeypatch):
+    monkeypatch.setattr(handler, "_r2", lambda: None)
+    out = handler._lipsync_r2({
+        "project": "neon",
+        "clip_key": "renders/neon/clips/s.mp4",
+        "audio_key": "audio/uuid.wav",  # flat staging -- no project segment
+    })
+    assert out["ok"] is False
+    assert "must be under audio/neon/" in out["error"]
+
+
+def test_r2_accepts_project_scoped_audio_prefix():
+    assert handler._scoped_key_error(
+        "audio/neon/s.wav", "audio_key", project="neon",
+        prefixes=("renders/", "audio/")) is None

@@ -443,15 +443,20 @@ def _project_prefix(project):
 
 
 def _scoped_key_error(key, what, *, project, prefixes=("renders/",)):
-    """Prefix-check plus project tenancy for renders/ keys. Staged beds under audio/ stay flat."""
+    """Prefix-check plus project tenancy. renders/ and audio/ keys must both sit under
+    renders/<project>/ or audio/<project>/ (no flat audio/ exemption -- that was a cross-project read)."""
     err = _key_error(key, what, prefixes=prefixes)
     if err:
         return err
     pref = _project_prefix(project)
     if not pref:
         return f"{what}: project is required for R2 mode"
+    p = pref[len("renders/"):].rstrip("/")  # validated project segment
     k = str(key)
     if k.startswith("audio/"):
+        audio_pref = f"audio/{p}/"
+        if not k.startswith(audio_pref):
+            return f"{what}: R2 key must be under {audio_pref}"
         return None
     if not k.startswith(pref):
         return f"{what}: R2 key must be under {pref}"
