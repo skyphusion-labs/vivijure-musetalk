@@ -37,11 +37,14 @@ loud (vivijure #245).
 
 import copy
 import glob
+import ipaddress
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlparse
 
 import boto3
 import numpy as np
@@ -115,8 +118,44 @@ def _r2():
     )
 
 
+# Optional pin for presigned hosts (e.g. ".r2.cloudflarestorage.com"). Empty = skip host-suffix check.
+R2_URL_HOST_SUFFIX = os.environ.get("R2_URL_HOST_SUFFIX", "").strip().lower()
+
+
+def _url_error(url, what):
+    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+
+    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
+    the hostname and reject blocked address classes; callers must also pass allow_redirects=False so a
+    public host cannot bounce into a private one via Location."""
+    try:
+        p = urlparse(str(url or ""))
+    except Exception:  # noqa: BLE001 -- malformed URL is a job error, not a crash
+        return f"{what}: malformed URL"
+    if p.scheme != "https" or not p.hostname:
+        return f"{what}: URL must be https with a hostname"
+    host = p.hostname.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return f"{what}: URL host is blocked"
+    if R2_URL_HOST_SUFFIX:
+        suffix = R2_URL_HOST_SUFFIX if R2_URL_HOST_SUFFIX.startswith(".") else f".{R2_URL_HOST_SUFFIX}"
+        bare = suffix.lstrip(".")
+        if host != bare and not host.endswith(suffix):
+            return f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}"
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return f"{what}: URL host does not resolve"
+    for _fam, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return f"{what}: URL resolves to a blocked address"
+    return None
+
+
 def _get(url, dst):
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False) as r:
         r.raise_for_status()
         with open(dst, "wb") as f:
             for chunk in r.iter_content(1 << 20):
@@ -414,7 +453,7 @@ def _stamp_sidecar_presigned(hash_url, output_hash):
         return
     try:
         body = str(output_hash).encode("utf-8")
-        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT,
+        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
                      headers={"content-type": "text/plain", "content-length": str(len(body))}).raise_for_status()
     except Exception:  # noqa: BLE001 -- best-effort provenance; a miss = safe re-run
         pass
@@ -476,6 +515,13 @@ def _lipsync_presigned(inp):
     output_key = inp.get("output_key", "")
     if not (video_url and audio_url and output_url):
         return {"ok": False, "error": "input needs presigned video_url + audio_url + output_url"}
+    for u, name in ((video_url, "video_url"), (audio_url, "audio_url"),
+                    (output_url, "output_url"), (inp.get("hash_url"), "hash_url")):
+        if name == "hash_url" and not u:
+            continue  # optional sidecar target
+        err = _url_error(u, name)
+        if err:
+            return {"ok": False, "error": err}
     bbox_shift = int(inp.get("bbox_shift", 0) or 0)
     version = str(inp.get("version", "v15"))
     work = tempfile.mkdtemp(prefix="ls-")
@@ -490,7 +536,7 @@ def _lipsync_presigned(inp):
         if not size:
             return {"ok": False, "error": "lipsync produced no output"}
         with open(dst, "rb") as f:
-            put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT,
+            put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
                                headers={"content-type": "video/mp4", "content-length": str(size)})
         put.raise_for_status()
         _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
