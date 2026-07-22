@@ -13,6 +13,7 @@ _run_musetalk / _get / _r2, so none of the stubs are exercised.
 
 import contextlib
 import os
+import socket
 import sys
 import types
 
@@ -82,9 +83,24 @@ def _raise_crash(*a, **k):
 
 
 R2_JOB = {"clip_key": "renders/p/clips/s.mp4", "audio_key": "renders/p/audio/s.wav"}
+# Public https URLs; getaddrinfo is monkeypatched in tests that hit _url_error.
 PRESIGNED_JOB = {
-    "video_url": "u", "audio_url": "u", "output_url": "u", "output_key": "renders/p/clips/s_ls.mp4",
+    "video_url": "https://bucket.example/v",
+    "audio_url": "https://bucket.example/a",
+    "output_url": "https://bucket.example/o",
+    "output_key": "renders/p/clips/s_ls.mp4",
 }
+
+
+def _public_addrinfo(host, port, *a, **k):
+    # 8.8.8.8 is public; TEST-NET / documentation ranges are is_reserved in ipaddress.
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+
+
+@pytest.fixture(autouse=True)
+def _allow_presigned_hosts(monkeypatch):
+    """Presigned success-path tests need _url_error to accept fixture hosts without real DNS."""
+    monkeypatch.setattr(socket, "getaddrinfo", _public_addrinfo)
 
 
 def test_r2_no_face_completes_with_detail(monkeypatch):
@@ -338,3 +354,45 @@ def test_too_short_floor_is_inclusive():
 
 def test_too_short_never_trips_on_zero_expected():
     assert handler._lipsync_too_short(0, 0) is False
+
+
+# --- Presigned URL SSRF gate -----------------------------------------------------------------
+
+
+def test_url_error_rejects_http_and_private(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
+    assert handler._url_error("http://evil.example/x", "video_url")
+    assert handler._url_error("https://127.0.0.1/x", "video_url")
+    assert "blocked" in handler._url_error("https://loop.example/x", "video_url")
+
+
+def test_url_error_accepts_public_https(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _public_addrinfo)
+    assert handler._url_error("https://bucket.example/obj", "video_url") is None
+
+
+def test_url_error_host_suffix_pin(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _public_addrinfo)
+    monkeypatch.setattr(handler, "R2_URL_HOST_SUFFIX", ".r2.cloudflarestorage.com")
+    assert handler._url_error("https://evil.example/x", "video_url")
+    assert handler._url_error(
+        "https://acct.r2.cloudflarestorage.com/obj", "video_url") is None
+
+
+def test_presigned_rejects_bad_url_before_get(monkeypatch):
+    called = {"get": 0}
+
+    def boom(*a, **k):
+        called["get"] += 1
+        raise AssertionError("_get must not run for rejected URLs")
+
+    monkeypatch.setattr(handler, "_get", boom)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_presigned({
+        "video_url": "http://169.254.169.254/latest",
+        "audio_url": "https://bucket.example/a",
+        "output_url": "https://bucket.example/o",
+    })
+    assert out["ok"] is False and "error" in out
+    assert called["get"] == 0
