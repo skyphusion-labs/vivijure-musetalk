@@ -8,6 +8,14 @@ consumer image. This file records the why behind each release; the tag is the ve
 - **docs(hub):** add `.runpod/hub.json` + `tests.json`, Hub badge, `THIRD_PARTY_MODELS.md`, and
   Hub R2 env notes (`R2_ENDPOINT_URL`) for RunPod Hub publish (musetalk#57).
 
+## v1.0.3
+
+- **fix(lipsync): rest-hold source frames on silence-pad tail (#67, PR #68).** Padded trailing
+  silence kept MuseTalk generating unstable mouth motion after dialogue ended. `_pad_audio_to_video()`
+  now returns speech duration; frames at/after the speech-end index passthrough the source frame (mouth
+  at rest) while the full padded audio track still muxes to the face-clip duration. Handler-only
+  release; base image unchanged.
+
 ## v1.0.0
 
 - **First stable release of the MuseTalk lip-sync finish module.** The lip-sync satellite in the
