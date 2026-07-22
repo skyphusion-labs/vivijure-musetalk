@@ -214,7 +214,7 @@ def test_zero_detection_detection_raises_softdegrade(monkeypatch, tmp_path):
     # call with everything upstream stubbed (GPU-free).
     _fake_musetalk_raising_zerodiv(monkeypatch)
     monkeypatch.setattr(sys.modules["torch"], "no_grad", lambda: contextlib.nullcontext(), raising=False)
-    monkeypatch.setattr(handler, "_pad_audio_to_video", lambda a, v, w: a)
+    monkeypatch.setattr(handler, "_pad_audio_to_video", lambda a, v, w: (a, 0.0))
     monkeypatch.setattr(handler, "_pipeline", lambda version: {
         "device": None, "vae": None, "unet": None, "pe": None, "timesteps": None, "weight_dtype": None,
         "whisper": None, "fp": None,
@@ -358,6 +358,48 @@ def test_too_short_floor_is_inclusive():
 
 def test_too_short_never_trips_on_zero_expected():
     assert handler._lipsync_too_short(0, 0) is False
+
+
+# --- #67: silence-pad tail rest-hold (pure, GPU-free) ----------------------------------------
+
+
+def test_speech_end_frame_maps_dialogue_duration_to_frame_index():
+    # 1.4s dialogue @ 16fps -> frame 22 is first rest-hold (0..21 synced, 22+ passthrough).
+    assert handler._speech_end_frame(1.4, 16, 81) == 22
+
+
+def test_speech_end_frame_clamps_to_clip_length():
+    assert handler._speech_end_frame(10.0, 16, 81) == 81
+
+
+def test_speech_end_frame_unknown_duration_syncs_whole_clip():
+    assert handler._speech_end_frame(0.0, 16, 81) == 81
+
+
+def test_speech_end_frame_keeps_at_least_one_synced_frame():
+    assert handler._speech_end_frame(0.01, 16, 81) == 1
+
+
+def test_pad_audio_tuple_returns_speech_dur_before_pad(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    video = tmp_path / "v.mp4"
+    audio.touch()
+    video.touch()
+    monkeypatch.setattr(handler, "_probe_dur", lambda p: 1.4 if p == str(audio) else 5.0)
+    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert speech_dur == 1.4
+    assert path == str(audio) or path.endswith("audio_padded.wav")
+
+
+def test_pad_audio_no_pad_when_dialogue_fills_clip(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    video = tmp_path / "v.mp4"
+    audio.touch()
+    video.touch()
+    monkeypatch.setattr(handler, "_probe_dur", lambda p: 4.98 if p == str(audio) else 5.0)
+    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert path == str(audio)
+    assert speech_dur == 4.98
 
 
 # --- Presigned URL SSRF gate -----------------------------------------------------------------

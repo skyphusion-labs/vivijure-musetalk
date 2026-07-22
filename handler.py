@@ -173,24 +173,39 @@ def _probe_dur(path):
         return 0.0
 
 
+def _speech_end_frame(speech_dur, fps, total_frames):
+    """Exclusive frame index where dialogue ends; tail frames hold the source mouth at rest (#67).
+
+    When the dialogue WAV is shorter than the face clip, `_pad_audio_to_video()` pads trailing silence
+    so the mux keeps full clip length. MuseTalk still drives one output frame per padded-audio frame;
+    whisper features on the silence tail are unstable and produce jittery lip motion after the line
+    finishes. Frames at/after this index passthrough the source frame instead of blending generated
+    mouth motion."""
+    if speech_dur <= 0 or fps <= 0 or total_frames <= 0:
+        return total_frames
+    return min(total_frames, max(1, int(round(speech_dur * fps))))
+
+
 def _pad_audio_to_video(audio_path, video_path, work):
     """MuseTalk's output length follows the AUDIO track. When the dialogue is shorter than the face
     clip, MuseTalk emits only the synced (talking) segment and TRUNCATES the shot to the dialogue
     length (a 5s i2v shot synced to a 1.4s line came out 1.4s -- the scatter talking-film clip-drop).
     Pad the audio with trailing silence to the face-clip duration so the synced output keeps the FULL
-    clip length: the line is spoken at the head, the mouth rests for the remainder. Returns the path
-    to feed inference (the original if no pad is needed or the pad fails -- never worse than today)."""
+    clip length: the line is spoken at the head, the mouth rests for the remainder (#67 rest-hold on
+    the tail in `_run_musetalk`, not generative lip-sync on near-silent whisper). Returns
+    `(audio_path_for_mux, speech_dur)` where `speech_dur` is the original dialogue duration (seconds)
+    before any pad; the path is the original if no pad is needed or the pad fails."""
     adur = _probe_dur(audio_path)
     vdur = _probe_dur(video_path)
     if vdur <= 0 or adur <= 0 or adur >= vdur - 0.05:
-        return audio_path
+        return audio_path, adur if adur > 0 else 0.0
     padded = os.path.join(work, "audio_padded.wav")
     try:
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
                         "-af", "apad", "-t", f"{vdur:.3f}", padded], check=True)
     except Exception:  # noqa: BLE001 -- pad failure falls back to the original audio
-        return audio_path
-    return padded
+        return audio_path, adur
+    return padded, adur
 
 
 def _pipeline(version):
@@ -270,7 +285,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     os.makedirs(out_frames_dir, exist_ok=True)
     try:
         # Pad a short dialogue track to the face-clip duration so MuseTalk keeps the full clip length.
-        audio_path = _pad_audio_to_video(audio_path, face_path, work)
+        mux_audio_path, speech_dur = _pad_audio_to_video(audio_path, face_path, work)
 
         # Extract source frames.
         subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
@@ -279,10 +294,11 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         if not input_img_list:
             raise RuntimeError("no frames extracted from face clip")
         fps = get_video_fps(face_path)
+        speech_end = _speech_end_frame(speech_dur, fps, len(input_img_list))
 
-        # Whisper audio features.
+        # Whisper audio features (padded audio drives one output frame per clip frame).
         with torch.no_grad():
-            feats, librosa_length = audio_processor.get_audio_feature(audio_path)
+            feats, librosa_length = audio_processor.get_audio_feature(mux_audio_path)
             whisper_chunks = audio_processor.get_whisper_chunk(
                 feats, device, weight_dtype, whisper, librosa_length, fps=fps,
                 audio_padding_length_left=AUDIO_PAD_LEFT, audio_padding_length_right=AUDIO_PAD_RIGHT)
@@ -333,6 +349,11 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         for i, res_frame in enumerate(res_frame_list):
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
+            if i >= speech_end:
+                # #67: padded silence tail -- hold the source mouth at rest, not generative sync.
+                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), ori_frame)
+                written += 1
+                continue
             x1, y1, x2, y2 = bbox
             if version == "v15":
                 y2 = min(y2 + EXTRA_MARGIN, ori_frame.shape[0])
@@ -375,7 +396,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         # (~CRF 23, roughly 2 Mbps at 48fps 720p), silently discarding the CRF-18 first pass above
         # and starving the mouth region MuseTalk just generated (the breathy look an anime 2x upscale
         # then magnifies -- vivijure #584). Stream-copy the video; only the audio is encoded here.
-        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", audio_path, "-i", temp_vid,
+        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", mux_audio_path, "-i", temp_vid,
                         "-c:v", "copy", out_path], check=True)
         if not os.path.exists(out_path) or not os.path.getsize(out_path):
             # Inference ran but assembled no usable output (detection too sparse / gapped to mux the
