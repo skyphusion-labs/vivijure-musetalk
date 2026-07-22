@@ -1,5 +1,7 @@
 # vivijure-musetalk
 
+[![Runpod](https://api.runpod.io/badge/skyphusion-labs/vivijure-musetalk)](https://console.runpod.io/hub/skyphusion-labs/vivijure-musetalk)
+
 **Gives your film's characters mouths that move in time with their spoken lines.** This is the
 lip-sync finish engine for [Vivijure](https://github.com/skyphusion-labs/vivijure), the AI film
 studio. It runs on a GPU (RunPod), takes a face clip and an audio track, and hands back a clip whose

@@ -1,0 +1,11 @@
+{
+  "tests": [
+    { "name": "selftest", "input": { "selftest": true }, "timeout": 600000 }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA H200",
+    "gpuCount": 1,
+    "env": [],
+    "allowedCudaVersions": ["12.8"]
+  }
+}

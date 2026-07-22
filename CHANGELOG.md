@@ -3,6 +3,11 @@
 The image ships as a git-tag-driven release (`v<X.Y.Z>`; see `RELEASES.md`). Each tag builds the
 consumer image. This file records the why behind each release; the tag is the version of record.
 
+## Unreleased
+
+- **docs(hub):** add `.runpod/hub.json` + `tests.json`, Hub badge, `THIRD_PARTY_MODELS.md`, and
+  Hub R2 env notes (`R2_ENDPOINT_URL`) for RunPod Hub publish (musetalk#57).
+
 ## v1.0.0
 
 - **First stable release of the MuseTalk lip-sync finish module.** The lip-sync satellite in the
