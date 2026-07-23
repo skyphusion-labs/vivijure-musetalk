@@ -426,6 +426,25 @@ def test_url_error_host_suffix_pin(monkeypatch):
         "https://acct.r2.cloudflarestorage.com/obj", "video_url") is None
 
 
+def test_presigned_rejects_ssrf_hash_url_before_put(monkeypatch):
+    puts = {"n": 0}
+
+    def fake_put(url, **kwargs):
+        puts["n"] += 1
+        raise AssertionError("PUT must not run for rejected hash_url")
+
+    monkeypatch.setattr(handler.requests, "put", fake_put, raising=False)
+    monkeypatch.setattr(handler, "_get", lambda *a, **k: None)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_presigned({
+        **PRESIGNED_JOB,
+        "output_hash": "deadbeef",
+        "hash_url": "http://169.254.169.254/latest",
+    })
+    assert out["ok"] is False and "error" in out
+    assert puts["n"] == 0
+
+
 def test_presigned_rejects_bad_url_before_get(monkeypatch):
     called = {"get": 0}
 

@@ -513,6 +513,9 @@ def _stamp_sidecar_presigned(hash_url, output_hash):
     deployment gets provenance once the core presigns hash_url. Same opaque + best-effort contract."""
     if not (hash_url and output_hash):
         return
+    err = _url_error(hash_url, "hash_url")
+    if err:
+        return
     try:
         body = str(output_hash).encode("utf-8")
         requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
