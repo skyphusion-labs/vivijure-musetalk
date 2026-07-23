@@ -17,3 +17,6 @@ When `R2_URL_HOST_SUFFIX` is unset, presigned GET/PUT targets homelab operator-c
 | 2026-07-23 | K3 repo | workflow_dispatch input in shell | Self-hosted dispatch; org-member only |
 | 2026-07-23 | K3 repo | code-coverage workflow token scopes | Standard org CI; fork PR guard |
 | 2026-07-23 | K3 repo | Presigned SSRF host pin optional | Homelab mode; prod template sets suffix |
+| 2026-07-23 | K3 verify ~18:04 | R2 secret as plain string in hub.json | RunPod Hub UI masks secrets at runtime; operator configures template |
+| 2026-07-23 | K3 verify ~18:04 | Model weights without integrity pin | Operator bake-time; gdown/HF at Docker build |
+| 2026-07-23 | K3 verify ~18:04 | packages:write on non-publish CI | GHCR push gated to tag/release paths |
