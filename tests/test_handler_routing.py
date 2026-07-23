@@ -31,7 +31,10 @@ def _stub(name, **attrs):
 _stub("torch", __version__="0-stub")
 _stub("boto3", client=lambda *a, **k: None)
 _stub("numpy")
-_stub("requests")
+# urllib3 backs DNS-pinned presigned fetches; stub before handler import (CI installs pytest only).
+_urllib3_exc = types.SimpleNamespace(HTTPError=Exception)
+_stub("urllib3", Timeout=lambda **k: object(), HTTPSConnectionPool=lambda *a, **k: None,
+       exceptions=_urllib3_exc)
 # runpod.serverless.start runs at import time (the last line of handler.py); make it a no-op.
 _runpod = _stub("runpod")
 _runpod.serverless = types.SimpleNamespace(start=lambda *a, **k: None)
@@ -283,15 +286,13 @@ def test_r2_sidecar_write_failure_never_fails_the_render(monkeypatch):
 
 def test_presigned_stamps_sidecar_only_when_hash_url_provided(monkeypatch):
     puts = []
-    class _Resp:
-        def raise_for_status(self):
-            pass
     monkeypatch.setattr(handler, "_get", _touch)
     monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
-    def _fake_put(url, data=None, **k):
-        puts.append((url, data))
-        return _Resp()
-    monkeypatch.setattr(handler.requests, "put", _fake_put, raising=False)
+
+    def _fake_pinned_put(url, body, *, headers):
+        puts.append((url, body))
+
+    monkeypatch.setattr(handler, "_pinned_put", _fake_pinned_put)
     # with hash_url -> sidecar PUT happens (artifact PUT + sidecar PUT = 2)
     handler._lipsync_presigned({**PRESIGNED_JOB, "output_hash": "deadbeef", "hash_url": "https://hash.put"})
     assert ("https://hash.put", b"deadbeef") in puts
@@ -461,11 +462,11 @@ def test_pinned_get_connects_to_validated_ip(monkeypatch, tmp_path):
 def test_presigned_rejects_ssrf_hash_url_before_put(monkeypatch):
     puts = {"n": 0}
 
-    def fake_put(url, **kwargs):
+    def fake_pinned_put(url, body, *, headers):
         puts["n"] += 1
         raise AssertionError("PUT must not run for rejected hash_url")
 
-    monkeypatch.setattr(handler.requests, "put", fake_put, raising=False)
+    monkeypatch.setattr(handler, "_pinned_put", fake_pinned_put)
     monkeypatch.setattr(handler, "_get", lambda *a, **k: None)
     monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
     out = handler._lipsync_presigned({
