@@ -448,9 +448,18 @@ def _key_error(key, what, prefixes=("renders/",)):
     Refused as data (this handler reports errors, it does not raise): returns the error string,
     or None when the key is fine."""
     k = str(key or "")
-    ok = (bool(k) and k == k.strip() and not k.startswith("/") and "\\" not in k
-          and ".." not in k.split("/") and k.startswith(tuple(prefixes)))
-    return None if ok else f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if not k or k != k.strip() or "\x00" in k:
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if k.startswith("/") or "\\" in k or ".." in k.split("/"):
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if not k.startswith(tuple(prefixes)):
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    parts = k.split("/")
+    if any(not part for part in parts):
+        return f"{what}: R2 key {k!r} must not contain empty path segments"
+    if k.endswith("/"):
+        return f"{what}: R2 key {k!r} must not end with /"
+    return None
 
 
 def _project_prefix(project):

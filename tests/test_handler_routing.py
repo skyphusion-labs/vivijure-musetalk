@@ -487,3 +487,9 @@ def test_r2_accepts_project_scoped_audio_prefix():
     assert handler._scoped_key_error(
         "audio/neon/s.wav", "audio_key", project="neon",
         prefixes=("renders/", "audio/")) is None
+
+
+def test_key_error_rejects_empty_segments_and_trailing_slash():
+    assert handler._key_error("renders/p//clips/s.mp4", "clip_key") is not None
+    assert handler._key_error("renders/p/clips/", "clip_key") is not None
+    assert handler._key_error("renders/p/clips/s.mp4\x00", "clip_key") is not None
