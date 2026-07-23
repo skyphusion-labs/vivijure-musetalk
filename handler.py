@@ -42,6 +42,7 @@ import ipaddress
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -49,9 +50,9 @@ from urllib.parse import urlparse
 
 import boto3
 import numpy as np
-import requests
 import runpod
 import torch
+import urllib3
 
 MUSETALK_DIR = os.environ.get("MUSETALK_DIR", "/app/MuseTalk")
 WHISPER_DIR = os.path.join(MUSETALK_DIR, "models", "whisper")
@@ -123,44 +124,98 @@ def _r2():
 R2_URL_HOST_SUFFIX = os.environ.get("R2_URL_HOST_SUFFIX", "").strip().lower()
 
 
-def _url_error(url, what):
-    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+def _blocked_ip(ip_str):
+    ip = ipaddress.ip_address(ip_str)
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
-    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
-    the hostname and reject blocked address classes; callers must also pass allow_redirects=False so a
-    public host cannot bounce into a private one via Location."""
+
+def _resolve_pinned_ip(url, what):
+    """Resolve hostname once and return (host, ip, port, path). Raises ValueError on SSRF."""
     try:
         p = urlparse(str(url or ""))
-    except Exception:  # noqa: BLE001 -- malformed URL is a job error, not a crash
-        return f"{what}: malformed URL"
+    except Exception as exc:  # noqa: BLE001 -- malformed URL is a job error, not a crash
+        raise ValueError(f"{what}: malformed URL") from exc
     if p.scheme != "https" or not p.hostname:
-        return f"{what}: URL must be https with a hostname"
+        raise ValueError(f"{what}: URL must be https with a hostname")
     host = p.hostname.lower()
     if host == "localhost" or host.endswith(".localhost"):
-        return f"{what}: URL host is blocked"
+        raise ValueError(f"{what}: URL host is blocked")
     if R2_URL_HOST_SUFFIX:
         suffix = R2_URL_HOST_SUFFIX if R2_URL_HOST_SUFFIX.startswith(".") else f".{R2_URL_HOST_SUFFIX}"
         bare = suffix.lstrip(".")
         if host != bare and not host.endswith(suffix):
-            return f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}"
+            raise ValueError(f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}")
+    port = p.port or 443
     try:
-        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return f"{what}: URL host does not resolve"
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"{what}: URL host does not resolve") from exc
+    pinned = None
     for _fam, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return f"{what}: URL resolves to a blocked address"
+        ip = sockaddr[0]
+        if _blocked_ip(ip):
+            raise ValueError(f"{what}: URL resolves to a blocked address")
+        pinned = ip
+        break
+    if not pinned:
+        raise ValueError(f"{what}: URL host does not resolve")
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    return host, pinned, port, path
+
+
+def _url_error(url, what):
+    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+
+    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
+    the hostname and reject blocked address classes; _pinned_get/_pinned_put connect to the validated
+    IP so DNS rebinding cannot swap public->private between check and fetch (#69)."""
+    try:
+        _resolve_pinned_ip(url, what)
+    except ValueError as e:
+        return str(e)
     return None
 
 
-def _get(url, dst):
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False) as r:
-        r.raise_for_status()
+def _pinned_pool(host, ip, port):
+    """HTTPS pool pinned to a validated IP with correct SNI for the original hostname."""
+    ctx = ssl.create_default_context()
+    return urllib3.HTTPSConnectionPool(
+        ip, port, timeout=urllib3.Timeout(connect=30, read=DOWNLOAD_TIMEOUT),
+        cert_reqs=ssl.CERT_REQUIRED, assert_hostname=host, server_hostname=host, ssl_context=ctx)
+
+
+def _pinned_get(url, dst):
+    host, ip, port, path = _resolve_pinned_ip(url, "GET")
+    pool = _pinned_pool(host, ip, port)
+    resp = pool.request("GET", path, headers={"Host": host}, preload_content=False, redirect=False)
+    try:
+        if resp.status >= 400:
+            raise urllib3.exceptions.HTTPError(f"HTTP {resp.status}")
         with open(dst, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
+            for chunk in resp.stream(1 << 20):
                 f.write(chunk)
+    finally:
+        resp.release_conn()
+
+
+def _pinned_put(url, body, *, headers):
+    host, ip, port, path = _resolve_pinned_ip(url, "PUT")
+    pool = _pinned_pool(host, ip, port)
+    hdrs = dict(headers)
+    hdrs["Host"] = host
+    resp = pool.request("PUT", path, body=body, headers=hdrs, redirect=False)
+    try:
+        if resp.status >= 400:
+            raise urllib3.exceptions.HTTPError(f"HTTP {resp.status}")
+    finally:
+        resp.release_conn()
+
+
+def _get(url, dst):
+    _pinned_get(url, dst)
 
 
 def _probe_dur(path):
@@ -518,8 +573,9 @@ def _stamp_sidecar_presigned(hash_url, output_hash):
         return
     try:
         body = str(output_hash).encode("utf-8")
-        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
-                     headers={"content-type": "text/plain", "content-length": str(len(body))}).raise_for_status()
+        _pinned_put(hash_url, body, headers={
+            "content-type": "text/plain", "content-length": str(len(body)),
+        })
     except Exception:  # noqa: BLE001 -- best-effort provenance; a miss = safe re-run
         pass
 
@@ -603,9 +659,9 @@ def _lipsync_presigned(inp):
         if not size:
             return {"ok": False, "error": "lipsync produced no output"}
         with open(dst, "rb") as f:
-            put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
-                               headers={"content-type": "video/mp4", "content-length": str(size)})
-        put.raise_for_status()
+            _pinned_put(output_url, f.read(), headers={
+                "content-type": "video/mp4", "content-length": str(size),
+            })
         _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "output_key": output_key, "bytes": size,
                 "version": version, "applied": [f"lipsync:{version}"]}

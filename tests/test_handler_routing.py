@@ -426,6 +426,38 @@ def test_url_error_host_suffix_pin(monkeypatch):
         "https://acct.r2.cloudflarestorage.com/obj", "video_url") is None
 
 
+def test_pinned_get_connects_to_validated_ip(monkeypatch, tmp_path):
+    """#69: fetch uses the IP from _resolve_pinned_ip (DNS pinning), not a second lookup."""
+    seen = {}
+
+    class _FakeResp:
+        status = 200
+
+        @staticmethod
+        def stream(_chunk):
+            return [b"pinned-bytes"]
+
+        @staticmethod
+        def release_conn():
+            pass
+
+    class _FakePool:
+        def request(self, method, path, headers=None, **_kw):
+            seen["method"] = method
+            seen["path"] = path
+            seen["host"] = headers.get("Host")
+            return _FakeResp()
+
+    monkeypatch.setattr(socket, "getaddrinfo", _public_addrinfo)
+    monkeypatch.setattr(handler, "_pinned_pool", lambda host, ip, port: (seen.update({"ip": ip}) or _FakePool()))
+    dst = tmp_path / "out.bin"
+    handler._pinned_get("https://bucket.example/obj", str(dst))
+    assert dst.read_bytes() == b"pinned-bytes"
+    assert seen["ip"] == "8.8.8.8"
+    assert seen["host"] == "bucket.example"
+    assert seen["method"] == "GET"
+
+
 def test_presigned_rejects_ssrf_hash_url_before_put(monkeypatch):
     puts = {"n": 0}
 
