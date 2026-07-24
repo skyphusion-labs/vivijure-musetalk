@@ -3,7 +3,7 @@
     { "name": "selftest", "input": { "selftest": true }, "timeout": 600000 }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA H200",
+    "gpuTypeId": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "gpuCount": 1,
     "env": [],
     "allowedCudaVersions": ["12.8"]

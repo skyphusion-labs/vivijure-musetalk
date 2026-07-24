@@ -7,7 +7,7 @@
   "config": {
     "runsOn": "GPU",
     "gpuCount": 1,
-    "gpuIds": "BLACKWELL_180,HOPPER_141,-NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition,-NVIDIA RTX PRO 6000 Blackwell Server Edition,-NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "gpuIds": "BLACKWELL_96,HOPPER_141,BLACKWELL_180",
     "containerDiskInGb": 40,
     "allowedCudaVersions": ["12.8"],
     "presets": [
