@@ -31,7 +31,10 @@ def _stub(name, **attrs):
 _stub("torch", __version__="0-stub")
 _stub("boto3", client=lambda *a, **k: None)
 _stub("numpy")
-_stub("requests")
+# urllib3 backs DNS-pinned presigned fetches; stub before handler import (CI installs pytest only).
+_urllib3_exc = types.SimpleNamespace(HTTPError=Exception)
+_stub("urllib3", Timeout=lambda **k: object(), HTTPSConnectionPool=lambda *a, **k: None,
+       exceptions=_urllib3_exc)
 # runpod.serverless.start runs at import time (the last line of handler.py); make it a no-op.
 _runpod = _stub("runpod")
 _runpod.serverless = types.SimpleNamespace(start=lambda *a, **k: None)
@@ -283,15 +286,13 @@ def test_r2_sidecar_write_failure_never_fails_the_render(monkeypatch):
 
 def test_presigned_stamps_sidecar_only_when_hash_url_provided(monkeypatch):
     puts = []
-    class _Resp:
-        def raise_for_status(self):
-            pass
     monkeypatch.setattr(handler, "_get", _touch)
     monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
-    def _fake_put(url, data=None, **k):
-        puts.append((url, data))
-        return _Resp()
-    monkeypatch.setattr(handler.requests, "put", _fake_put, raising=False)
+
+    def _fake_pinned_put(url, body, *, headers):
+        puts.append((url, body))
+
+    monkeypatch.setattr(handler, "_pinned_put", _fake_pinned_put)
     # with hash_url -> sidecar PUT happens (artifact PUT + sidecar PUT = 2)
     handler._lipsync_presigned({**PRESIGNED_JOB, "output_hash": "deadbeef", "hash_url": "https://hash.put"})
     assert ("https://hash.put", b"deadbeef") in puts
@@ -380,14 +381,42 @@ def test_speech_end_frame_keeps_at_least_one_synced_frame():
     assert handler._speech_end_frame(0.01, 16, 81) == 1
 
 
+def test_parse_speech_end_sec_uses_first_trailing_silence():
+    log = "[silencedetect @ 0x0] silence_start: 1.420\n"
+    assert abs(handler._parse_speech_end_sec(log, 5.0) - 1.48) < 0.01
+
+
+def test_parse_speech_end_sec_falls_back_to_file_dur_without_silence():
+    assert handler._parse_speech_end_sec("", 1.42) == 1.42
+    assert handler._parse_speech_end_sec("[silencedetect] silence_start: 0.01\n", 5.0) == 5.0
+
+
+def test_parse_speech_end_sec_ignores_leading_silence_at_zero():
+    log = "[silencedetect] silence_start: 0.0\n[silencedetect] silence_end: 0.08\n[silencedetect] silence_start: 1.35\n"
+    assert abs(handler._parse_speech_end_sec(log, 5.0) - 1.41) < 0.01
+
+
+def test_pad_audio_tuple_returns_speech_end_not_container_dur(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    video = tmp_path / "v.mp4"
+    audio.touch()
+    video.touch()
+    monkeypatch.setattr(handler, "_probe_dur", lambda p: 4.98 if p == str(audio) else 5.0)
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.42)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert path == str(audio)
+    assert speech_end == 1.42
+
+
 def test_pad_audio_tuple_returns_speech_dur_before_pad(monkeypatch, tmp_path):
     audio = tmp_path / "a.wav"
     video = tmp_path / "v.mp4"
     audio.touch()
     video.touch()
     monkeypatch.setattr(handler, "_probe_dur", lambda p: 1.4 if p == str(audio) else 5.0)
-    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
-    assert speech_dur == 1.4
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.4)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert speech_end == 1.4
     assert path == str(audio) or path.endswith("audio_padded.wav")
 
 
@@ -397,9 +426,10 @@ def test_pad_audio_no_pad_when_dialogue_fills_clip(monkeypatch, tmp_path):
     audio.touch()
     video.touch()
     monkeypatch.setattr(handler, "_probe_dur", lambda p: 4.98 if p == str(audio) else 5.0)
-    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.42)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
     assert path == str(audio)
-    assert speech_dur == 4.98
+    assert speech_end == 1.42
 
 
 # --- Presigned URL SSRF gate -----------------------------------------------------------------
@@ -424,6 +454,57 @@ def test_url_error_host_suffix_pin(monkeypatch):
     assert handler._url_error("https://evil.example/x", "video_url")
     assert handler._url_error(
         "https://acct.r2.cloudflarestorage.com/obj", "video_url") is None
+
+
+def test_pinned_get_connects_to_validated_ip(monkeypatch, tmp_path):
+    """#69: fetch uses the IP from _resolve_pinned_ip (DNS pinning), not a second lookup."""
+    seen = {}
+
+    class _FakeResp:
+        status = 200
+
+        @staticmethod
+        def stream(_chunk):
+            return [b"pinned-bytes"]
+
+        @staticmethod
+        def release_conn():
+            pass
+
+    class _FakePool:
+        def request(self, method, path, headers=None, **_kw):
+            seen["method"] = method
+            seen["path"] = path
+            seen["host"] = headers.get("Host")
+            return _FakeResp()
+
+    monkeypatch.setattr(socket, "getaddrinfo", _public_addrinfo)
+    monkeypatch.setattr(handler, "_pinned_pool", lambda host, ip, port: (seen.update({"ip": ip}) or _FakePool()))
+    dst = tmp_path / "out.bin"
+    handler._pinned_get("https://bucket.example/obj", str(dst))
+    assert dst.read_bytes() == b"pinned-bytes"
+    assert seen["ip"] == "8.8.8.8"
+    assert seen["host"] == "bucket.example"
+    assert seen["method"] == "GET"
+
+
+def test_presigned_rejects_ssrf_hash_url_before_put(monkeypatch):
+    puts = {"n": 0}
+
+    def fake_pinned_put(url, body, *, headers):
+        puts["n"] += 1
+        raise AssertionError("PUT must not run for rejected hash_url")
+
+    monkeypatch.setattr(handler, "_pinned_put", fake_pinned_put)
+    monkeypatch.setattr(handler, "_get", lambda *a, **k: None)
+    monkeypatch.setattr(handler, "_run_musetalk", _run_ok)
+    out = handler._lipsync_presigned({
+        **PRESIGNED_JOB,
+        "output_hash": "deadbeef",
+        "hash_url": "http://169.254.169.254/latest",
+    })
+    assert out["ok"] is False and "error" in out
+    assert puts["n"] == 0
 
 
 def test_presigned_rejects_bad_url_before_get(monkeypatch):
@@ -487,3 +568,9 @@ def test_r2_accepts_project_scoped_audio_prefix():
     assert handler._scoped_key_error(
         "audio/neon/s.wav", "audio_key", project="neon",
         prefixes=("renders/", "audio/")) is None
+
+
+def test_key_error_rejects_empty_segments_and_trailing_slash():
+    assert handler._key_error("renders/p//clips/s.mp4", "clip_key") is not None
+    assert handler._key_error("renders/p/clips/", "clip_key") is not None
+    assert handler._key_error("renders/p/clips/s.mp4\x00", "clip_key") is not None

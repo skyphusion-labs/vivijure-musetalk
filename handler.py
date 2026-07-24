@@ -42,6 +42,7 @@ import ipaddress
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -49,9 +50,9 @@ from urllib.parse import urlparse
 
 import boto3
 import numpy as np
-import requests
 import runpod
 import torch
+import urllib3
 
 MUSETALK_DIR = os.environ.get("MUSETALK_DIR", "/app/MuseTalk")
 WHISPER_DIR = os.path.join(MUSETALK_DIR, "models", "whisper")
@@ -123,44 +124,98 @@ def _r2():
 R2_URL_HOST_SUFFIX = os.environ.get("R2_URL_HOST_SUFFIX", "").strip().lower()
 
 
-def _url_error(url, what):
-    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+def _blocked_ip(ip_str):
+    ip = ipaddress.ip_address(ip_str)
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
-    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
-    the hostname and reject blocked address classes; callers must also pass allow_redirects=False so a
-    public host cannot bounce into a private one via Location."""
+
+def _resolve_pinned_ip(url, what):
+    """Resolve hostname once and return (host, ip, port, path). Raises ValueError on SSRF."""
     try:
         p = urlparse(str(url or ""))
-    except Exception:  # noqa: BLE001 -- malformed URL is a job error, not a crash
-        return f"{what}: malformed URL"
+    except Exception as exc:  # noqa: BLE001 -- malformed URL is a job error, not a crash
+        raise ValueError(f"{what}: malformed URL") from exc
     if p.scheme != "https" or not p.hostname:
-        return f"{what}: URL must be https with a hostname"
+        raise ValueError(f"{what}: URL must be https with a hostname")
     host = p.hostname.lower()
     if host == "localhost" or host.endswith(".localhost"):
-        return f"{what}: URL host is blocked"
+        raise ValueError(f"{what}: URL host is blocked")
     if R2_URL_HOST_SUFFIX:
         suffix = R2_URL_HOST_SUFFIX if R2_URL_HOST_SUFFIX.startswith(".") else f".{R2_URL_HOST_SUFFIX}"
         bare = suffix.lstrip(".")
         if host != bare and not host.endswith(suffix):
-            return f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}"
+            raise ValueError(f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}")
+    port = p.port or 443
     try:
-        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return f"{what}: URL host does not resolve"
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"{what}: URL host does not resolve") from exc
+    pinned = None
     for _fam, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return f"{what}: URL resolves to a blocked address"
+        ip = sockaddr[0]
+        if _blocked_ip(ip):
+            raise ValueError(f"{what}: URL resolves to a blocked address")
+        pinned = ip
+        break
+    if not pinned:
+        raise ValueError(f"{what}: URL host does not resolve")
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    return host, pinned, port, path
+
+
+def _url_error(url, what):
+    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+
+    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
+    the hostname and reject blocked address classes; _pinned_get/_pinned_put connect to the validated
+    IP so DNS rebinding cannot swap public->private between check and fetch (#69)."""
+    try:
+        _resolve_pinned_ip(url, what)
+    except ValueError as e:
+        return str(e)
     return None
 
 
-def _get(url, dst):
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False) as r:
-        r.raise_for_status()
+def _pinned_pool(host, ip, port):
+    """HTTPS pool pinned to a validated IP with correct SNI for the original hostname."""
+    ctx = ssl.create_default_context()
+    return urllib3.HTTPSConnectionPool(
+        ip, port, timeout=urllib3.Timeout(connect=30, read=DOWNLOAD_TIMEOUT),
+        cert_reqs=ssl.CERT_REQUIRED, assert_hostname=host, server_hostname=host, ssl_context=ctx)
+
+
+def _pinned_get(url, dst):
+    host, ip, port, path = _resolve_pinned_ip(url, "GET")
+    pool = _pinned_pool(host, ip, port)
+    resp = pool.request("GET", path, headers={"Host": host}, preload_content=False, redirect=False)
+    try:
+        if resp.status >= 400:
+            raise urllib3.exceptions.HTTPError(f"HTTP {resp.status}")
         with open(dst, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
+            for chunk in resp.stream(1 << 20):
                 f.write(chunk)
+    finally:
+        resp.release_conn()
+
+
+def _pinned_put(url, body, *, headers):
+    host, ip, port, path = _resolve_pinned_ip(url, "PUT")
+    pool = _pinned_pool(host, ip, port)
+    hdrs = dict(headers)
+    hdrs["Host"] = host
+    resp = pool.request("PUT", path, body=body, headers=hdrs, redirect=False)
+    try:
+        if resp.status >= 400:
+            raise urllib3.exceptions.HTTPError(f"HTTP {resp.status}")
+    finally:
+        resp.release_conn()
+
+
+def _get(url, dst):
+    _pinned_get(url, dst)
 
 
 def _probe_dur(path):
@@ -173,14 +228,58 @@ def _probe_dur(path):
         return 0.0
 
 
+# #67: rest-hold must follow the SPOKEN boundary, not the WAV container length. TTS (and upstream pad)
+# can ship a full-length track whose tail is already silent; v1.0.3 used ffprobe duration and kept
+# generative sync on that near-silent tail -> jitter after the line.
+MIN_SPEECH_BEFORE_SILENCE_SEC = 0.12
+PHONEME_TAIL_SEC = 0.06
+SILENCE_DETECT_AF = "silencedetect=noise=-35dB:d=0.25"
+
+
+def _parse_speech_end_sec(log_text, file_dur):
+    """Pure: infer spoken-content end (seconds) from ffmpeg silencedetect stderr. Falls back to
+    `file_dur` when no trailing silence is detected (speech runs to EOF)."""
+    if file_dur <= 0:
+        return 0.0
+    starts = []
+    for line in (log_text or "").splitlines():
+        if "silence_start:" not in line:
+            continue
+        try:
+            starts.append(float(line.split("silence_start:")[-1].strip()))
+        except ValueError:
+            continue
+    if not starts:
+        return file_dur
+    meaningful = [s for s in starts if s >= MIN_SPEECH_BEFORE_SILENCE_SEC]
+    if not meaningful:
+        return file_dur
+    end = meaningful[0] + PHONEME_TAIL_SEC
+    return min(file_dur, max(end, MIN_SPEECH_BEFORE_SILENCE_SEC))
+
+
+def _probe_speech_end_sec(audio_path):
+    """Spoken-content duration in seconds (silencedetect), or file duration when detection fails."""
+    fdur = _probe_dur(audio_path)
+    if fdur <= 0:
+        return 0.0
+    try:
+        p = subprocess.run(["ffmpeg", "-v", "info", "-i", audio_path,
+                            "-af", SILENCE_DETECT_AF, "-f", "null", "-"],
+                           capture_output=True, text=True)
+        return _parse_speech_end_sec((p.stderr or "") + (p.stdout or ""), fdur)
+    except Exception:  # noqa: BLE001
+        return fdur
+
+
 def _speech_end_frame(speech_dur, fps, total_frames):
-    """Exclusive frame index where dialogue ends; tail frames hold the source mouth at rest (#67).
+    """Exclusive frame index where dialogue ends; tail frames hold the last synced mouth at rest (#67).
 
     When the dialogue WAV is shorter than the face clip, `_pad_audio_to_video()` pads trailing silence
     so the mux keeps full clip length. MuseTalk still drives one output frame per padded-audio frame;
     whisper features on the silence tail are unstable and produce jittery lip motion after the line
-    finishes. Frames at/after this index passthrough the source frame instead of blending generated
-    mouth motion."""
+    finishes. Frames at/after this index reuse the last blended frame (mouth frozen) instead of
+    generative sync on near-silent whisper."""
     if speech_dur <= 0 or fps <= 0 or total_frames <= 0:
         return total_frames
     return min(total_frames, max(1, int(round(speech_dur * fps))))
@@ -193,19 +292,23 @@ def _pad_audio_to_video(audio_path, video_path, work):
     Pad the audio with trailing silence to the face-clip duration so the synced output keeps the FULL
     clip length: the line is spoken at the head, the mouth rests for the remainder (#67 rest-hold on
     the tail in `_run_musetalk`, not generative lip-sync on near-silent whisper). Returns
-    `(audio_path_for_mux, speech_dur)` where `speech_dur` is the original dialogue duration (seconds)
-    before any pad; the path is the original if no pad is needed or the pad fails."""
+    `(audio_path_for_mux, speech_end_sec)` where `speech_end_sec` is the detected end of spoken
+    content (silencedetect on the original WAV, before any handler pad); the path is the original if
+    no pad is needed or the pad fails."""
     adur = _probe_dur(audio_path)
     vdur = _probe_dur(video_path)
+    speech_end_sec = _probe_speech_end_sec(audio_path)
+    if speech_end_sec <= 0:
+        speech_end_sec = adur if adur > 0 else 0.0
     if vdur <= 0 or adur <= 0 or adur >= vdur - 0.05:
-        return audio_path, adur if adur > 0 else 0.0
+        return audio_path, speech_end_sec
     padded = os.path.join(work, "audio_padded.wav")
     try:
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
                         "-af", "apad", "-t", f"{vdur:.3f}", padded], check=True)
     except Exception:  # noqa: BLE001 -- pad failure falls back to the original audio
-        return audio_path, adur
-    return padded, adur
+        return audio_path, speech_end_sec
+    return padded, speech_end_sec
 
 
 def _pipeline(version):
@@ -285,7 +388,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     os.makedirs(out_frames_dir, exist_ok=True)
     try:
         # Pad a short dialogue track to the face-clip duration so MuseTalk keeps the full clip length.
-        mux_audio_path, speech_dur = _pad_audio_to_video(audio_path, face_path, work)
+        mux_audio_path, speech_end_sec = _pad_audio_to_video(audio_path, face_path, work)
 
         # Extract source frames.
         subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
@@ -294,7 +397,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         if not input_img_list:
             raise RuntimeError("no frames extracted from face clip")
         fps = get_video_fps(face_path)
-        speech_end = _speech_end_frame(speech_dur, fps, len(input_img_list))
+        speech_end = _speech_end_frame(speech_end_sec, fps, len(input_img_list))
 
         # Whisper audio features (padded audio drives one output frame per clip frame).
         with torch.no_grad():
@@ -346,12 +449,14 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         # on a real face bbox: a placeholder / degenerate bbox (a false-positive detection on a faceless
         # clip, e.g. a lighthouse) resizes to a zero area and is dropped here, exactly as upstream does.
         written = 0
+        last_blended = None
         for i, res_frame in enumerate(res_frame_list):
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
             if i >= speech_end:
-                # #67: padded silence tail -- hold the source mouth at rest, not generative sync.
-                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), ori_frame)
+                # #67: silence tail -- freeze the last synced mouth, not generative whisper jitter.
+                hold = last_blended if last_blended is not None else ori_frame
+                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), hold)
                 written += 1
                 continue
             x1, y1, x2, y2 = bbox
@@ -369,6 +474,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
             # a %08d gap -- the image2 encoder below stops at the first missing index, which
             # deterministically truncated shot_01 to 3 of 65 frames (0.17s) on any early no-face frame.
             cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), combine)
+            last_blended = combine
             written += 1
 
         # No blended frame landed on a usable face region: the detector false-positived on a faceless
@@ -448,9 +554,18 @@ def _key_error(key, what, prefixes=("renders/",)):
     Refused as data (this handler reports errors, it does not raise): returns the error string,
     or None when the key is fine."""
     k = str(key or "")
-    ok = (bool(k) and k == k.strip() and not k.startswith("/") and "\\" not in k
-          and ".." not in k.split("/") and k.startswith(tuple(prefixes)))
-    return None if ok else f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if not k or k != k.strip() or "\x00" in k:
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if k.startswith("/") or "\\" in k or ".." in k.split("/"):
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    if not k.startswith(tuple(prefixes)):
+        return f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
+    parts = k.split("/")
+    if any(not part for part in parts):
+        return f"{what}: R2 key {k!r} must not contain empty path segments"
+    if k.endswith("/"):
+        return f"{what}: R2 key {k!r} must not end with /"
+    return None
 
 
 def _project_prefix(project):
@@ -504,10 +619,14 @@ def _stamp_sidecar_presigned(hash_url, output_hash):
     deployment gets provenance once the core presigns hash_url. Same opaque + best-effort contract."""
     if not (hash_url and output_hash):
         return
+    err = _url_error(hash_url, "hash_url")
+    if err:
+        return
     try:
         body = str(output_hash).encode("utf-8")
-        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
-                     headers={"content-type": "text/plain", "content-length": str(len(body))}).raise_for_status()
+        _pinned_put(hash_url, body, headers={
+            "content-type": "text/plain", "content-length": str(len(body)),
+        })
     except Exception:  # noqa: BLE001 -- best-effort provenance; a miss = safe re-run
         pass
 
@@ -591,9 +710,9 @@ def _lipsync_presigned(inp):
         if not size:
             return {"ok": False, "error": "lipsync produced no output"}
         with open(dst, "rb") as f:
-            put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT, allow_redirects=False,
-                               headers={"content-type": "video/mp4", "content-length": str(size)})
-        put.raise_for_status()
+            _pinned_put(output_url, f.read(), headers={
+                "content-type": "video/mp4", "content-length": str(size),
+            })
         _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "output_key": output_key, "bytes": size,
                 "version": version, "applied": [f"lipsync:{version}"]}
