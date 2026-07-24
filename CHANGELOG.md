@@ -5,8 +5,24 @@ consumer image. This file records the why behind each release; the tag is the ve
 
 ## Unreleased
 
-- **docs(hub):** add `.runpod/hub.json` + `tests.json`, Hub badge, `THIRD_PARTY_MODELS.md`, and
-  Hub R2 env notes (`R2_ENDPOINT_URL`) for RunPod Hub publish (musetalk#57).
+- Nothing yet.
+
+## v1.0.6
+
+- **fix(hub): align the Hub listing GPU pools and disk with the production endpoint (#79).** The
+  listing advertised `BLACKWELL_180,HOPPER_141` and explicitly negated the three RTX PRO 6000 cards
+  by name. Those cards ARE the `BLACKWELL_96` pool, which is the pool production endpoint
+  `zw6pt4lymf69pk` actually runs this worker on, so the listing excluded the one configuration we
+  prove daily and left a Hub deployer on B200 or H200 class hardware at roughly two to three times
+  the hourly cost for the same job. `gpuIds` is now `BLACKWELL_96,HOPPER_141,BLACKWELL_180`
+  (production pool first, larger pools kept as availability fallbacks; no unproven pool added), and
+  `tests.json` runs the Hub smoke on `NVIDIA RTX PRO 6000 Blackwell Server Edition`, the card
+  production runs on, so a green Hub test carries the same meaning our own endpoint carries.
+  `containerDiskInGb` stays 40, matching production. `.runpod/README.md` records the provenance and
+  the repin rule. Endpoint config, GPU pool membership, and image size were read live (read-only).
+- **Docs and listing metadata only.** The tag still bakes a consumer image (`build-image.yml` fires
+  on `v*` tags), and `:1.0.6` is functionally identical to `:1.0.5`. Production stays pinned to
+  `:1.0.5` on purpose; **no repin**.
 
 ## v1.0.5
 
