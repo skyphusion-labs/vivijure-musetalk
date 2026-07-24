@@ -10,7 +10,7 @@ consumer image. This file records the why behind each release; the tag is the ve
 
 ## v1.0.5
 
-- **fix(lipsync): silencedetect speech boundary + freeze last synced frame (#67, PR #TBD).** v1.0.3
+- **fix(lipsync): silencedetect speech boundary + freeze last synced frame (#67, PR #76).** v1.0.3
   rest-hold keyed off ffprobe file duration, so a dialogue WAV already padded to clip length (or with
   trailing silence in the container) still ran generative MuseTalk on the near-silent tail. The handler
   now detects spoken-content end via ffmpeg `silencedetect`, rest-holds from that frame, and freezes the
