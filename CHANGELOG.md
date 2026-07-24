@@ -46,6 +46,23 @@ consumer image. This file records the why behind each release; the tag is the ve
   at rest) while the full padded audio track still muxes to the face-clip duration. Handler-only
   release; base image unchanged.
 
+## v1.0.2
+
+- **fix(security): project-scoped R2 + SSRF gate (#63, #64, #65, #66).** Presigned URL validation,
+  `project` scope required for `renders/<project>/` and `audio/<project>/`, allowlist sync hardened,
+  host builds moved to `ubuntu-latest`, and the adversarial security audit workflow added.
+  Handler-only; base unchanged. Image `:1.0.2`.
+  (Backfilled 2026-07-25 from the v1.0.2 GitHub release; the row was missing from this file.)
+
+## v1.0.1
+
+- **docs(hub): RunPod Hub publish surface (musetalk#57).** `.runpod/hub.json` + `tests.json`
+  (`{"selftest": true}`), `.runpod/README.md` with the R2 env names (`R2_ENDPOINT_URL`),
+  `THIRD_PARTY_MODELS.md`, and the Hub badge. Docs-only patch cut so Hub, which indexes releases and
+  not commits, could index a release tree containing `.runpod/`. No handler or image-recipe change.
+  (Backfilled 2026-07-25: this entry sat under Unreleased, but `git tag --contains` puts the commit
+  in v1.0.1 through v1.0.5, so it shipped in v1.0.1.)
+
 ## v1.0.0
 
 - **First stable release of the MuseTalk lip-sync finish module.** The lip-sync satellite in the
