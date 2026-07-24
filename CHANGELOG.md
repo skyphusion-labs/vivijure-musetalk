@@ -8,6 +8,14 @@ consumer image. This file records the why behind each release; the tag is the ve
 - **docs(hub):** add `.runpod/hub.json` + `tests.json`, Hub badge, `THIRD_PARTY_MODELS.md`, and
   Hub R2 env notes (`R2_ENDPOINT_URL`) for RunPod Hub publish (musetalk#57).
 
+## v1.0.5
+
+- **fix(lipsync): silencedetect speech boundary + freeze last synced frame (#67, PR #76).** v1.0.3
+  rest-hold keyed off ffprobe file duration, so a dialogue WAV already padded to clip length (or with
+  trailing silence in the container) still ran generative MuseTalk on the near-silent tail. The handler
+  now detects spoken-content end via ffmpeg `silencedetect`, rest-holds from that frame, and freezes the
+  last blended mouth (not the raw i2v source) through the silence pad. Handler-only release.
+
 ## v1.0.4
 
 - **fix(security): DNS-pin presigned fetches (#69, K3 closeout).** `_pinned_get` / `_pinned_put`

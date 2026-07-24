@@ -228,14 +228,58 @@ def _probe_dur(path):
         return 0.0
 
 
+# #67: rest-hold must follow the SPOKEN boundary, not the WAV container length. TTS (and upstream pad)
+# can ship a full-length track whose tail is already silent; v1.0.3 used ffprobe duration and kept
+# generative sync on that near-silent tail -> jitter after the line.
+MIN_SPEECH_BEFORE_SILENCE_SEC = 0.12
+PHONEME_TAIL_SEC = 0.06
+SILENCE_DETECT_AF = "silencedetect=noise=-35dB:d=0.25"
+
+
+def _parse_speech_end_sec(log_text, file_dur):
+    """Pure: infer spoken-content end (seconds) from ffmpeg silencedetect stderr. Falls back to
+    `file_dur` when no trailing silence is detected (speech runs to EOF)."""
+    if file_dur <= 0:
+        return 0.0
+    starts = []
+    for line in (log_text or "").splitlines():
+        if "silence_start:" not in line:
+            continue
+        try:
+            starts.append(float(line.split("silence_start:")[-1].strip()))
+        except ValueError:
+            continue
+    if not starts:
+        return file_dur
+    meaningful = [s for s in starts if s >= MIN_SPEECH_BEFORE_SILENCE_SEC]
+    if not meaningful:
+        return file_dur
+    end = meaningful[0] + PHONEME_TAIL_SEC
+    return min(file_dur, max(end, MIN_SPEECH_BEFORE_SILENCE_SEC))
+
+
+def _probe_speech_end_sec(audio_path):
+    """Spoken-content duration in seconds (silencedetect), or file duration when detection fails."""
+    fdur = _probe_dur(audio_path)
+    if fdur <= 0:
+        return 0.0
+    try:
+        p = subprocess.run(["ffmpeg", "-v", "info", "-i", audio_path,
+                            "-af", SILENCE_DETECT_AF, "-f", "null", "-"],
+                           capture_output=True, text=True)
+        return _parse_speech_end_sec((p.stderr or "") + (p.stdout or ""), fdur)
+    except Exception:  # noqa: BLE001
+        return fdur
+
+
 def _speech_end_frame(speech_dur, fps, total_frames):
-    """Exclusive frame index where dialogue ends; tail frames hold the source mouth at rest (#67).
+    """Exclusive frame index where dialogue ends; tail frames hold the last synced mouth at rest (#67).
 
     When the dialogue WAV is shorter than the face clip, `_pad_audio_to_video()` pads trailing silence
     so the mux keeps full clip length. MuseTalk still drives one output frame per padded-audio frame;
     whisper features on the silence tail are unstable and produce jittery lip motion after the line
-    finishes. Frames at/after this index passthrough the source frame instead of blending generated
-    mouth motion."""
+    finishes. Frames at/after this index reuse the last blended frame (mouth frozen) instead of
+    generative sync on near-silent whisper."""
     if speech_dur <= 0 or fps <= 0 or total_frames <= 0:
         return total_frames
     return min(total_frames, max(1, int(round(speech_dur * fps))))
@@ -248,19 +292,23 @@ def _pad_audio_to_video(audio_path, video_path, work):
     Pad the audio with trailing silence to the face-clip duration so the synced output keeps the FULL
     clip length: the line is spoken at the head, the mouth rests for the remainder (#67 rest-hold on
     the tail in `_run_musetalk`, not generative lip-sync on near-silent whisper). Returns
-    `(audio_path_for_mux, speech_dur)` where `speech_dur` is the original dialogue duration (seconds)
-    before any pad; the path is the original if no pad is needed or the pad fails."""
+    `(audio_path_for_mux, speech_end_sec)` where `speech_end_sec` is the detected end of spoken
+    content (silencedetect on the original WAV, before any handler pad); the path is the original if
+    no pad is needed or the pad fails."""
     adur = _probe_dur(audio_path)
     vdur = _probe_dur(video_path)
+    speech_end_sec = _probe_speech_end_sec(audio_path)
+    if speech_end_sec <= 0:
+        speech_end_sec = adur if adur > 0 else 0.0
     if vdur <= 0 or adur <= 0 or adur >= vdur - 0.05:
-        return audio_path, adur if adur > 0 else 0.0
+        return audio_path, speech_end_sec
     padded = os.path.join(work, "audio_padded.wav")
     try:
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
                         "-af", "apad", "-t", f"{vdur:.3f}", padded], check=True)
     except Exception:  # noqa: BLE001 -- pad failure falls back to the original audio
-        return audio_path, adur
-    return padded, adur
+        return audio_path, speech_end_sec
+    return padded, speech_end_sec
 
 
 def _pipeline(version):
@@ -340,7 +388,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     os.makedirs(out_frames_dir, exist_ok=True)
     try:
         # Pad a short dialogue track to the face-clip duration so MuseTalk keeps the full clip length.
-        mux_audio_path, speech_dur = _pad_audio_to_video(audio_path, face_path, work)
+        mux_audio_path, speech_end_sec = _pad_audio_to_video(audio_path, face_path, work)
 
         # Extract source frames.
         subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
@@ -349,7 +397,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         if not input_img_list:
             raise RuntimeError("no frames extracted from face clip")
         fps = get_video_fps(face_path)
-        speech_end = _speech_end_frame(speech_dur, fps, len(input_img_list))
+        speech_end = _speech_end_frame(speech_end_sec, fps, len(input_img_list))
 
         # Whisper audio features (padded audio drives one output frame per clip frame).
         with torch.no_grad():
@@ -401,12 +449,14 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         # on a real face bbox: a placeholder / degenerate bbox (a false-positive detection on a faceless
         # clip, e.g. a lighthouse) resizes to a zero area and is dropped here, exactly as upstream does.
         written = 0
+        last_blended = None
         for i, res_frame in enumerate(res_frame_list):
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
             if i >= speech_end:
-                # #67: padded silence tail -- hold the source mouth at rest, not generative sync.
-                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), ori_frame)
+                # #67: silence tail -- freeze the last synced mouth, not generative whisper jitter.
+                hold = last_blended if last_blended is not None else ori_frame
+                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), hold)
                 written += 1
                 continue
             x1, y1, x2, y2 = bbox
@@ -424,6 +474,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
             # a %08d gap -- the image2 encoder below stops at the first missing index, which
             # deterministically truncated shot_01 to 3 of 65 frames (0.17s) on any early no-face frame.
             cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), combine)
+            last_blended = combine
             written += 1
 
         # No blended frame landed on a usable face region: the detector false-positived on a faceless

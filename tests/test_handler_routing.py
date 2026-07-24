@@ -381,14 +381,42 @@ def test_speech_end_frame_keeps_at_least_one_synced_frame():
     assert handler._speech_end_frame(0.01, 16, 81) == 1
 
 
+def test_parse_speech_end_sec_uses_first_trailing_silence():
+    log = "[silencedetect @ 0x0] silence_start: 1.420\n"
+    assert abs(handler._parse_speech_end_sec(log, 5.0) - 1.48) < 0.01
+
+
+def test_parse_speech_end_sec_falls_back_to_file_dur_without_silence():
+    assert handler._parse_speech_end_sec("", 1.42) == 1.42
+    assert handler._parse_speech_end_sec("[silencedetect] silence_start: 0.01\n", 5.0) == 5.0
+
+
+def test_parse_speech_end_sec_ignores_leading_silence_at_zero():
+    log = "[silencedetect] silence_start: 0.0\n[silencedetect] silence_end: 0.08\n[silencedetect] silence_start: 1.35\n"
+    assert abs(handler._parse_speech_end_sec(log, 5.0) - 1.41) < 0.01
+
+
+def test_pad_audio_tuple_returns_speech_end_not_container_dur(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    video = tmp_path / "v.mp4"
+    audio.touch()
+    video.touch()
+    monkeypatch.setattr(handler, "_probe_dur", lambda p: 4.98 if p == str(audio) else 5.0)
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.42)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert path == str(audio)
+    assert speech_end == 1.42
+
+
 def test_pad_audio_tuple_returns_speech_dur_before_pad(monkeypatch, tmp_path):
     audio = tmp_path / "a.wav"
     video = tmp_path / "v.mp4"
     audio.touch()
     video.touch()
     monkeypatch.setattr(handler, "_probe_dur", lambda p: 1.4 if p == str(audio) else 5.0)
-    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
-    assert speech_dur == 1.4
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.4)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    assert speech_end == 1.4
     assert path == str(audio) or path.endswith("audio_padded.wav")
 
 
@@ -398,9 +426,10 @@ def test_pad_audio_no_pad_when_dialogue_fills_clip(monkeypatch, tmp_path):
     audio.touch()
     video.touch()
     monkeypatch.setattr(handler, "_probe_dur", lambda p: 4.98 if p == str(audio) else 5.0)
-    path, speech_dur = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
+    monkeypatch.setattr(handler, "_probe_speech_end_sec", lambda p: 1.42)
+    path, speech_end = handler._pad_audio_to_video(str(audio), str(video), str(tmp_path / "work"))
     assert path == str(audio)
-    assert speech_dur == 4.98
+    assert speech_end == 1.42
 
 
 # --- Presigned URL SSRF gate -----------------------------------------------------------------
