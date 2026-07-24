@@ -1,5 +1,5 @@
 # Serve overlay for homelab LOCAL_FINISH_LIPSYNC_URL (RunPod-compatible /run + /status).
-ARG MUSETALK_IMAGE=ghcr.io/skyphusion-labs/vivijure-musetalk:1.0.3
+ARG MUSETALK_IMAGE=ghcr.io/skyphusion-labs/vivijure-musetalk:1.0.5
 FROM ${MUSETALK_IMAGE}
 
 COPY handler.py runpod_http_serve.py serve.py /app/
