@@ -10,27 +10,20 @@ brick that gives the films talking characters whose mouths match the speech: it 
 dialogue / close shots with a clear face in frame. Pairs with `vivijure-upscale` (MuseTalk works a
 256x256 face region, so a synced shot should pass back through Real-ESRGAN to return to delivery res).
 
-This repo is the image + the RunPod handler; the studio-side `lipsync` module worker (a thin CF Worker
-behind the typed finish hook in `vivijure`) is what calls this endpoint. Image:
-`ghcr.io/skyphusion-labs/vivijure-musetalk` (current release tag **v0.1.0**, the immutable tag the
-endpoint pins to).
+This repo is the image + the RunPod handler; the studio-side `lipsync` module worker (thin module
+behind the typed finish hook on `vivijure-cf` / `vivijure-local`, types from `vivijure-core`) is what
+calls this endpoint. Image: `ghcr.io/skyphusion-labs/vivijure-musetalk`. **Pin by versioned tag** from
+git tags / GHCR (see latest `v*`); do not treat any single number in this file as "current forever".
 
-## The Vivijure constellation (the same map is in each repo)
+## The Vivijure constellation
 
 ```
-   friends + Slate (Discord)
+   vivijure-cf / vivijure-local  (panels; core: vivijure-core)
             |
             v
-        slate  -->  vivijure (studio control plane / JSON API)
-                        |
-                        v
-                  vivijure-backend (GPU render: keyframes -> i2v -> assemble)
-                        |
-            +-----------+-------------+-------------------+
-            |           |             |                   |
-   vivijure-musetalk  vivijure-   vivijure-audio-   vivijure-local-backend
-   (lipsync module)   upscale     upscale           (self-host render path)
-       ^-- THIS REPO
+   vivijure-backend + finish satellites
+            |
+     musetalk (THIS) | upscale | audio-upscale | wan-train | local-12/16gb
 ```
 
 ## Handler contract (the job, `handler.py`)
@@ -76,14 +69,12 @@ python -m py_compile handler.py
 ```
 
 **Release / deploy mechanics.** `.github/workflows/build-image.yml` builds + pushes to GHCR on a push
-to `main` (touching the build inputs) as `:latest` + `:<sha>`; a pushed semver tag (`v0.1.0`) ALSO
-publishes the bare `:0.1.0` (the immutable tag the endpoint pins to, never `:sha`, never `:latest`).
-PUBLIC repo, so CI runs on GitHub-hosted `ubuntu-latest` (the "Free disk space" step reclaims room for
-the tens-of-GB CUDA build). The RunPod endpoint's image tag, **GPU type, and R2 env are dashboard /
-endpoint-config knobs** (RunPod's API does not honor them); **container-registry-auth IS now
-MCP/API-manageable** (RunPod MCP `create-container-registry-auth` + attach via `containerRegistryAuthId`
-on create/update-template, no dashboard step). `scripts/phase0_pod.sh` is the live-pod bring-up used to
-validate the recipe.
+to `main` (touching the build inputs) as `:latest` + `:<sha>`; a pushed SemVer tag `vMAJOR.MINOR.PATCH`
+ALSO publishes the bare `:MAJOR.MINOR.PATCH` (the immutable tag the endpoint pins to; never pin prod
+to `:sha` or `:latest` alone). PUBLIC repo; CI on GitHub-hosted `ubuntu-latest`. Operator sets the
+RunPod endpoint image tag, GPU type, and R2 env (**never freeze endpoint IDs here**).
+**container-registry-auth** is MCP/API-manageable (`containerRegistryAuthId` on template).
+`scripts/phase0_pod.sh` is the live-pod bring-up used to validate the recipe.
 
 ## Verifying changes
 
@@ -91,9 +82,10 @@ The recipe is fragile by nature (py3.12 + cu128/torch2.8 + an openmmlab source b
 line is proven on a live pod, not guessed; `requirements.txt` is a human-readable manifest of the proven
 pin set, NOT a flat `pip install -r` (order + `--no-deps` / `--no-build-isolation` / `MMCV_WITH_OPS` /
 the version pins matter and a flat install will not reproduce a working env). After any dependency or
-Dockerfile change: build clean, then run `{"selftest": true}` on a real GPU and confirm `ok:true` with a
-non-zero `output_bytes` before cutting a release tag. `TORCH_CUDA_ARCH_LIST` here is REAL (mmcv compiles
-CUDA ops): `8.6;8.9;9.0;12.0`. A missing arch is "no kernel image is available for execution" at runtime.
+Dockerfile change: build clean, then **SecurePod** `{"selftest": true}` on a real GPU and confirm
+`ok:true` with a non-zero `output_bytes` before cutting a release tag / repinning prod. Verify the
+**artifact**, not only the pipeline. `TORCH_CUDA_ARCH_LIST` here is REAL (mmcv compiles CUDA ops):
+`8.6;8.9;9.0;12.0`. A missing arch is "no kernel image is available for execution" at runtime.
 
 ## Architecture
 
@@ -125,7 +117,8 @@ CUDA ops): `8.6;8.9;9.0;12.0`. A missing arch is "no kernel image is available f
 - Operating memory for the vivijure family lives in the per-project memory under
   `~/.claude/projects/-home-conrad-dev-vivijure/memory/` (`seg-vivijure-modules` is the relevant
   segment); load it before acting.
-- **HARD AUP line:** the CSAM bright line is absolute (see the vivijure project memory). Non-negotiable.
+- **HARD AUP line:** the CSAM bright line is absolute. Non-negotiable.
+- **Ignore Cursor `AGENTS.md`.** Clean room discipline for GPU engines. No endpoint-ID freezes.
 
 ## Commits & versioning
 
