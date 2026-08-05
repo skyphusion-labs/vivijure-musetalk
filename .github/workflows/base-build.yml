@@ -9,7 +9,7 @@ name: base-build
 # Dockerfile then repins its FROM ...@sha256 digest to the printed value. It is NOT wired to push/tag
 # triggers, so a routine commit can never silently re-bake the base and un-pin the consumer.
 #
-# Runner: Plane C `[self-hosted, gpu]` (vivijure-gpu-builds; fc#754). Disk-reclaim stays
+# Runner: Plane C `[self-hosted, bake-capable]` (vivijure-gpu-builds; fc#754). Disk-reclaim stays
 # hosted-only (propagandhi has TB-class free space).
 
 on:
@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   base:
-    runs-on: [self-hosted, gpu]
+    runs-on: [self-hosted, bake-capable]
     timeout-minutes: 240
     env:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-musetalk
