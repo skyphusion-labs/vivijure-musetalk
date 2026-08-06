@@ -125,3 +125,9 @@ Dockerfile change: build clean, then **SecurePod** `{"selftest": true}` on a rea
 Conventional Commits (`feat(scope):`, `fix(scope):`, `docs:`); body explains the why. SemVer-style
 `0.MINOR.PATCH` while pre-1.0 (PATCH for fixes / backend tweaks, MINOR for features). A release is a
 pushed `vMAJOR.MINOR.PATCH` git tag (CI publishes the matching immutable image tag the endpoint pins to).
+
+## Release / deploy
+
+**Tag-gated production deploy.** Merges to `main` run CI only; they do not ship production.
+Cut an annotated SemVer tag on `main` to release (`git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`).
+Deploy workflows assert the tag commit is an ancestor of `origin/main`.
