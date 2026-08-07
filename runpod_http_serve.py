@@ -162,6 +162,9 @@ def token_error(headers_token: str | None, expected: str) -> tuple[int, dict] | 
     return None
 
 
+MAX_HTTP_BODY_BYTES = 1_048_576  # 1 MiB cap on POST /run (K3: memory DoS)
+
+
 def route(
     method: str,
     path: str,
@@ -177,12 +180,16 @@ def route(
         return 200, {"ok": True, "service": service, "version": version, "mode": "local-finish-http"}
 
     if method == "POST" and path == "/run":
-        payload = (body or {}).get("input", body or {})
-        if (body or {}).get("selftest") or payload.get("selftest"):
-            return 200, {"ok": True, "selftest": True, "service": service}
         err = token_error(token, expected_token)
         if err:
             return err
+        payload = (body or {}).get("input", body or {})
+        # vivijure-musetalk#92 / vivijure-upscale#88: selftest is FORWARDED to the wrapped handler
+        # like any other job, never intercepted here. The handler's own {"selftest": true}
+        # path is the documented deploy-verification GPU check (loads the model, runs a real
+        # lipsync); answering it at this layer without reaching the handler would make that
+        # check structurally incapable of failing (ok:true on a box with no GPU, a broken
+        # model, or a missing weight). /health remains the fast auth-free liveness probe.
         job_id = registry.submit(payload)
         return 200, {"id": job_id}
 
@@ -245,7 +252,12 @@ def run_serve(
             return h[7:] if h.lower().startswith("bearer ") else None
 
         def _body(self) -> dict | None:
-            length = int(self.headers.get("content-length") or 0)
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                return None
+            if length < 0 or length > MAX_HTTP_BODY_BYTES:
+                return None
             if not length:
                 return None
             try:
