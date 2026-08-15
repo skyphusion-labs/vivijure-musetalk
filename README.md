@@ -109,6 +109,7 @@ Every setting is in `deploy.env`, and each one is explained in full (what it is,
 | `CONTAINER_DISK_GB` | Disk for the container (default 30; MuseTalk bakes ~7GB of weights). |
 | `WORKERS_MIN` / `WORKERS_MAX` | Scaling bounds; min 0 = scale to zero = pay nothing when idle. |
 | `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
+| `MAX_INVOCATION_SECONDS` | Wall-clock ceiling for ONE job, in seconds (default 540). Keep it below `EXECUTION_TIMEOUT_MS` (600s) or RunPod kills the worker before the handler can degrade honestly. |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
 
 Two per-job knobs the studio can pass: **`bbox_shift`** (default 0; nudges the mouth box up or down)

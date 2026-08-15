@@ -70,6 +70,23 @@ means and why.
 - **`EXECUTION_TIMEOUT_MS`** (default `600000`) -- the longest a single job may run, in milliseconds
   (600000 = 10 minutes). Why: a stuck job is cut off instead of billing forever. Example:
   `EXECUTION_TIMEOUT_MS=600000`.
+- **`MAX_INVOCATION_SECONDS`** (default `540`) -- the wall-clock ceiling for ONE job, in seconds,
+  enforced inside the handler. Why: without it a single stuck ffmpeg or a pathological clip runs
+  until something else kills it, and the only thing left to do that is the studio 90-minute phase
+  ceiling, which fails the WHOLE render rather than this one shot. When the ceiling is hit the job
+  stops and degrades honestly: the studio passes the ORIGINAL clip through and records why, so the
+  film still ships without the lip-sync on that shot. Example: `MAX_INVOCATION_SECONDS=540`.
+
+  **Keep it below `EXECUTION_TIMEOUT_MS`** (600s by default). Above it, RunPod kills the worker
+  first, and a platform kill is a hard failure the studio cannot tell apart from a crash, so you
+  lose the honest degrade the guard exists to produce.
+
+  What it covers: the R2 or presigned DOWNLOAD, every ffmpeg and ffprobe call, and every stage of
+  the lip-sync itself (whisper features, face detection, latent encode, UNet inference, blending,
+  encode, mux). What it does NOT cover, deliberately: queue wait and cold start, which happen before
+  the worker is handed the job, and the final artifact UPLOAD, because stopping after the work is
+  done and paid for would throw a finished render away.
+
 - **`CONTAINER_REGISTRY_AUTH_ID`** (default empty) -- a RunPod credential id for a **private** image.
   Why: if your image is private, RunPod needs a login to pull it. Make one in the RunPod console
   (Settings, then Container Registry Auth) and paste its id here. Leave it blank for a public image.
