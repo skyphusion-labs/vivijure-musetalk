@@ -46,6 +46,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlparse
 
 import boto3
@@ -73,6 +74,44 @@ def _ensure_musetalk_path():
 _ensure_musetalk_path()
 DOWNLOAD_TIMEOUT = 900
 UPLOAD_TIMEOUT = 900
+
+# Per-INVOCATION wall-clock guard, in seconds (#98). Before this the compute path had no wall-clock
+# bound of any kind: 0 of 6 subprocess.run sites carried a timeout=, and the single timeout= in the
+# file was the HTTP read on the presigned download below. A hung ffmpeg or a pathological clip ran
+# until something OUTSIDE this module killed it, and of the four finish doors this is the one where
+# the studio phase ceiling (vivijure-core PHASE_HARD_DEADLINE_SECONDS, 5400s) was the SOLE backstop
+# (vivijure-core#182). That ceiling fails the whole PHASE and cannot degrade one step, so a single
+# unbounded shot took a correctly-running film down with it.
+#
+# WHY 540 AND NOT A ROUND NUMBER. Three bounds; 540 is the largest value that respects all three.
+#   1. THE GUARD HAS TO WIN A RACE TO EXIST AT ALL. The reference deployment kills the job at 600s
+#      (deploy.sh EXECUTION_TIMEOUT_MS, default 600000, described in docs/deploy.md as the longest a
+#      single job may run). A platform kill is a FAILED envelope with NO structured output, which the
+#      studio classifies as a genuine crash and fails the render on. A guard at or above 600s could
+#      never fire there, so it would be decoration. This sits 60s under it.
+#   2. AGAINST THE STUDIO CEILING. A retry moves the studio attempts counter, never the progress
+#      index, so one step can burn FINISH_STEP_MAX_ATTEMPTS (3) full guards with the phase marker
+#      never moving. 3 * 540 = 1620s. Add the cold-start allowance the door already grants itself
+#      (RUNPOD_COLD_GRACE_MS, 900s) and roughly 60s of queue wait per attempt: 2700s, half of the
+#      5400s ceiling. The ceiling stays a backstop instead of becoming the first thing to fire.
+#   3. AGAINST THE WORK. The Hub smoke in .runpod/tests.json budgets 600000ms for a COLD selftest,
+#      which includes the ~5GB model load AND a full inference pass on the baked sample. 540s is 90%
+#      of a budget this repo already treats as generous for the slowest run this handler has.
+#
+# WHAT IT DOES NOT COVER, deliberately: queue wait and cold start happen before this process is
+# handed the job, and the artifact upload happens after the work is done and paid for (degrading
+# there would throw away a finished render). docs/deploy.md carries the full accounting.
+#
+# THIS IS A DEPLOYMENT FACT, NOT A MODULE CONSTANT. It is env-overridable, so when this module later
+# declares max_invocation_seconds (vivijure-core#182 / #223) it MUST relay the value it is RUNNING
+# with, read from here, never this literal default. The env var deliberately carries the same name as
+# that manifest field so the two cannot drift apart quietly.
+MAX_INVOCATION_SECONDS = int(os.environ.get("MAX_INVOCATION_SECONDS", "540") or "540")
+if MAX_INVOCATION_SECONDS <= 0:
+    # A non-positive budget is spent before the first check, so EVERY job would degrade to a
+    # passthrough and the door would quietly stop lip-syncing while every job still reported success.
+    # Refuse at import: loud, once, at deploy time.
+    raise ValueError("MAX_INVOCATION_SECONDS must be a positive number of seconds")
 
 # Inference constants pinned to MuseTalk's scripts.inference CLI defaults (so in-process output matches
 # what the old subprocess produced): batch 8, extra face margin 10, jaw parsing, 2/2 audio padding.
@@ -110,6 +149,69 @@ class SoftDegrade(Exception):
     RunPod lifts a top-level `error` to job status FAILED (which would fail the whole film). A GENUINE
     crash is NOT a SoftDegrade: it keeps returning `error` / raising, so the job lands FAILED and the
     render fails loud (vivijure #245)."""
+
+
+class _Deadline:
+    """ONE wall-clock budget for ONE invocation, established at entry and threaded through every
+    stage, so the thing bounded is the INVOCATION. Per-call timeouts bound each call and sum to a
+    total nobody stated; the studio compares its phase ceiling against the total, so the total is the
+    number that has to exist.
+
+    EXPIRY IS DATA, NEVER AN ESCAPING EXCEPTION. check() raises SoftDegrade, which both job modes
+    already catch and return as {"ok": false, "detail": ...}. The studio absorbs that into a
+    passthrough of the ORIGINAL clip, tags applied with passthrough:backend-soft-degrade and puts the
+    reason string in degraded (vivijure-cf modules/finish-lipsync/src/index.ts:331). An exception that
+    escaped instead would be booked FAILED with no structured output, which the same site classifies
+    as a genuine crash and fails the WHOLE film on. So every guarded site must stay inside a caller
+    that catches SoftDegrade, and the two broad except Exception fallbacks in this file (the duration
+    probe and the audio pad) must let an expiry PAST rather than swallow it into a fallback value.
+    """
+
+    def __init__(self, seconds=None):
+        self.seconds = MAX_INVOCATION_SECONDS if seconds is None else int(seconds)
+        self.started = time.monotonic()
+
+    def elapsed(self):
+        return time.monotonic() - self.started
+
+    def remaining(self):
+        return self.seconds - self.elapsed()
+
+    def reason(self, stage):
+        # The studio truncates this to 120 characters, so the guard name and the elapsed seconds go
+        # first and nothing load-bearing goes past that.
+        return (f"invocation exceeded MAX_INVOCATION_SECONDS={self.seconds}s "
+                f"at {stage} after {self.elapsed():.1f}s")
+
+    def check(self, stage):
+        # Call between stages and inside every unbounded loop. A check cannot interrupt a single
+        # blocking call, which is why every subprocess goes through _run_guarded below.
+        if self.remaining() <= 0:
+            raise SoftDegrade(self.reason(stage))
+
+    def subprocess_timeout(self):
+        # The budget left, as a subprocess timeout. Never negative (subprocess rejects that) and never
+        # zero, so a child is killed BY the deadline rather than refused before it starts.
+        return max(0.1, self.remaining())
+
+    def http_timeout(self, cap):
+        # A urllib3 read timeout that cannot outlive the budget. Floored so a nearly spent budget
+        # still attempts the read and ends at the next check rather than as a network error.
+        return max(1.0, min(float(cap), self.remaining()))
+
+
+def _run_guarded(cmd, deadline, stage, **kw):
+    """The ONLY subprocess entry point on the compute path. It spends the REMAINING invocation budget
+    as the child timeout and converts an expiry into the honest degrade, so a site added later cannot
+    quietly run unbounded and a broad except in a caller cannot turn the guard into a fallback value.
+    tests/test_handler_routing.py asserts against the SHIPPED SOURCE that this is the only
+    subprocess.run call in the file."""
+    dl = deadline or _Deadline()
+    dl.check(stage)
+    try:
+        return subprocess.run(cmd, timeout=dl.subprocess_timeout(), **kw)
+    except subprocess.TimeoutExpired:
+        raise SoftDegrade(dl.reason(stage)) from None
 
 
 def _r2():
@@ -179,17 +281,21 @@ def _url_error(url, what):
     return None
 
 
-def _pinned_pool(host, ip, port):
+def _pinned_pool(host, ip, port, read_timeout=DOWNLOAD_TIMEOUT):
     """HTTPS pool pinned to a validated IP with correct SNI for the original hostname."""
     ctx = ssl.create_default_context()
     return urllib3.HTTPSConnectionPool(
-        ip, port, timeout=urllib3.Timeout(connect=30, read=DOWNLOAD_TIMEOUT),
+        ip, port, timeout=urllib3.Timeout(connect=30, read=read_timeout),
         cert_reqs=ssl.CERT_REQUIRED, assert_hostname=host, server_hostname=host, ssl_context=ctx)
 
 
-def _pinned_get(url, dst):
+def _pinned_get(url, dst, deadline=None):
+    # The DOWNLOAD is inside the budget: a stalled fetch that ate the whole invocation would leave
+    # nothing for the work. The artifact PUT deliberately is not (see _pinned_put).
+    dl = deadline or _Deadline()
+    dl.check("download")
     host, ip, port, path = _resolve_pinned_ip(url, "GET")
-    pool = _pinned_pool(host, ip, port)
+    pool = _pinned_pool(host, ip, port, read_timeout=dl.http_timeout(DOWNLOAD_TIMEOUT))
     resp = pool.request("GET", path, headers={"Host": host}, preload_content=False, redirect=False)
     try:
         if resp.status >= 400:
@@ -214,16 +320,21 @@ def _pinned_put(url, body, *, headers):
         resp.release_conn()
 
 
-def _get(url, dst):
-    _pinned_get(url, dst)
+def _get(url, dst, deadline=None):
+    _pinned_get(url, dst, deadline=deadline)
 
 
-def _probe_dur(path):
+def _probe_dur(path, deadline=None):
     """Media duration in seconds (float), or 0.0 if unknown."""
     try:
-        p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "default=nw=1:nk=1", path], capture_output=True, text=True)
+        p = _run_guarded(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=nw=1:nk=1", path], deadline, "ffprobe-duration",
+                         capture_output=True, text=True)
         return float((p.stdout or "").strip() or 0.0)
+    except SoftDegrade:
+        # An expired budget is an EXPIRY, not an unknown duration. Without this the broad fallback
+        # below would turn the guard into a silent 0.0 and the invocation would carry on unbounded.
+        raise
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -258,16 +369,18 @@ def _parse_speech_end_sec(log_text, file_dur):
     return min(file_dur, max(end, MIN_SPEECH_BEFORE_SILENCE_SEC))
 
 
-def _probe_speech_end_sec(audio_path):
+def _probe_speech_end_sec(audio_path, deadline=None):
     """Spoken-content duration in seconds (silencedetect), or file duration when detection fails."""
-    fdur = _probe_dur(audio_path)
+    fdur = _probe_dur(audio_path, deadline=deadline)
     if fdur <= 0:
         return 0.0
     try:
-        p = subprocess.run(["ffmpeg", "-v", "info", "-i", audio_path,
-                            "-af", SILENCE_DETECT_AF, "-f", "null", "-"],
-                           capture_output=True, text=True)
+        p = _run_guarded(["ffmpeg", "-v", "info", "-i", audio_path,
+                          "-af", SILENCE_DETECT_AF, "-f", "null", "-"],
+                         deadline, "silencedetect", capture_output=True, text=True)
         return _parse_speech_end_sec((p.stderr or "") + (p.stdout or ""), fdur)
+    except SoftDegrade:
+        raise  # an expired budget is an expiry, not an undetectable speech boundary
     except Exception:  # noqa: BLE001
         return fdur
 
@@ -285,7 +398,7 @@ def _speech_end_frame(speech_dur, fps, total_frames):
     return min(total_frames, max(1, int(round(speech_dur * fps))))
 
 
-def _pad_audio_to_video(audio_path, video_path, work):
+def _pad_audio_to_video(audio_path, video_path, work, deadline=None):
     """MuseTalk's output length follows the AUDIO track. When the dialogue is shorter than the face
     clip, MuseTalk emits only the synced (talking) segment and TRUNCATES the shot to the dialogue
     length (a 5s i2v shot synced to a 1.4s line came out 1.4s -- the scatter talking-film clip-drop).
@@ -295,17 +408,20 @@ def _pad_audio_to_video(audio_path, video_path, work):
     `(audio_path_for_mux, speech_end_sec)` where `speech_end_sec` is the detected end of spoken
     content (silencedetect on the original WAV, before any handler pad); the path is the original if
     no pad is needed or the pad fails."""
-    adur = _probe_dur(audio_path)
-    vdur = _probe_dur(video_path)
-    speech_end_sec = _probe_speech_end_sec(audio_path)
+    adur = _probe_dur(audio_path, deadline=deadline)
+    vdur = _probe_dur(video_path, deadline=deadline)
+    speech_end_sec = _probe_speech_end_sec(audio_path, deadline=deadline)
     if speech_end_sec <= 0:
         speech_end_sec = adur if adur > 0 else 0.0
     if vdur <= 0 or adur <= 0 or adur >= vdur - 0.05:
         return audio_path, speech_end_sec
     padded = os.path.join(work, "audio_padded.wav")
     try:
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
-                        "-af", "apad", "-t", f"{vdur:.3f}", padded], check=True)
+        _run_guarded(["ffmpeg", "-v", "error", "-y", "-i", audio_path,
+                      "-af", "apad", "-t", f"{vdur:.3f}", padded], deadline, "audio-pad",
+                     check=True)
+    except SoftDegrade:
+        raise  # an expired budget is an expiry, not a pad that could not be produced
     except Exception:  # noqa: BLE001 -- pad failure falls back to the original audio
         return audio_path, speech_end_sec
     return padded, speech_end_sec
@@ -360,7 +476,7 @@ def _lipsync_too_short(written, expected, ratio=LIPSYNC_MIN_FRAME_RATIO):
     return expected > 0 and written < expected * ratio
 
 
-def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
+def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15", deadline=None):
     """Lip-sync one face clip against one audio track IN-PROCESS against the warm model cache, and write
     the muxed result to out_path. This mirrors scripts.inference's per-task loop exactly (frame extract ->
     whisper features -> landmark/crop latents -> batched UNet -> blend -> encode + mux), minus the
@@ -373,6 +489,10 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     from musetalk.utils.preprocessing import coord_placeholder, get_landmark_and_bbox
     from musetalk.utils.utils import datagen, get_video_fps
 
+    # ONE budget for the whole invocation, established by the caller so the download counts against
+    # it too. A caller that forgets still gets a guard rather than an unbounded run.
+    dl = deadline or _Deadline()
+    dl.check("model-load")
     version = version if version in UNET else "v15"
     p = _pipeline(version)
     device, vae, unet, pe = p["device"], p["vae"], p["unet"], p["pe"]
@@ -388,11 +508,11 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
     os.makedirs(out_frames_dir, exist_ok=True)
     try:
         # Pad a short dialogue track to the face-clip duration so MuseTalk keeps the full clip length.
-        mux_audio_path, speech_end_sec = _pad_audio_to_video(audio_path, face_path, work)
+        mux_audio_path, speech_end_sec = _pad_audio_to_video(audio_path, face_path, work, deadline=dl)
 
         # Extract source frames.
-        subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
-                        os.path.join(frames_dir, "%08d.png")], check=True)
+        _run_guarded(["ffmpeg", "-v", "fatal", "-y", "-i", face_path, "-start_number", "0",
+                      os.path.join(frames_dir, "%08d.png")], dl, "frame-extract", check=True)
         input_img_list = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
         if not input_img_list:
             raise RuntimeError("no frames extracted from face clip")
@@ -400,6 +520,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         speech_end = _speech_end_frame(speech_end_sec, fps, len(input_img_list))
 
         # Whisper audio features (padded audio drives one output frame per clip frame).
+        dl.check("whisper-features")
         with torch.no_grad():
             feats, librosa_length = audio_processor.get_audio_feature(mux_audio_path)
             whisper_chunks = audio_processor.get_whisper_chunk(
@@ -412,12 +533,14 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
             # raises ZeroDivisionError before it returns. That is the plainest no-face case (scenery that
             # does not even fool the detector, e.g. narration over a landscape) -- an honest soft-degrade,
             # not a crash. Catch ONLY that division; any other error still propagates as a genuine failure.
+            dl.check("landmark-detect")
             try:
                 coord_list, frame_list = get_landmark_and_bbox(input_img_list, bshift)
             except ZeroDivisionError:
                 raise SoftDegrade("no face detected in clip") from None
             input_latent_list = []
             for bbox, frame in zip(coord_list, frame_list):
+                dl.check("latent-encode")
                 if bbox == coord_placeholder:
                     continue
                 x1, y1, x2, y2 = bbox
@@ -438,6 +561,7 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
             gen = datagen(whisper_chunks=whisper_chunks, vae_encode_latents=input_latent_list_cycle,
                           batch_size=BATCH_SIZE, delay_frame=0, device=device)
             for whisper_batch, latent_batch in gen:
+                dl.check("unet-inference")
                 audio_feature_batch = pe(whisper_batch)
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
                 pred_latents = unet.model(
@@ -451,6 +575,9 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
         written = 0
         last_blended = None
         for i, res_frame in enumerate(res_frame_list):
+            # Checked at the TOP of the body, OUTSIDE the per-frame try/except below: that handler
+            # swallows any exception to drop a degenerate frame, and would swallow the guard too.
+            dl.check("blend")
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
             if i >= speech_end:
@@ -494,16 +621,17 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15"):
 
         # Encode the blended frames, then mux the audio back in.
         temp_vid = os.path.join(work, "temp.mp4")
-        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
-                        "-i", os.path.join(out_frames_dir, "%08d.png"),
-                        "-vcodec", "libx264", "-vf", "format=yuv420p", "-crf", "18", temp_vid], check=True)
+        _run_guarded(["ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
+                      "-i", os.path.join(out_frames_dir, "%08d.png"),
+                      "-vcodec", "libx264", "-vf", "format=yuv420p", "-crf", "18", temp_vid],
+                     dl, "encode", check=True)
         # Mux the audio into the CRF-18 video WITHOUT re-encoding the video (-c:v copy). ffmpeg
         # re-encodes by default, and with no codec given it would re-run libx264 at its default
         # (~CRF 23, roughly 2 Mbps at 48fps 720p), silently discarding the CRF-18 first pass above
         # and starving the mouth region MuseTalk just generated (the breathy look an anime 2x upscale
         # then magnifies -- vivijure #584). Stream-copy the video; only the audio is encoded here.
-        subprocess.run(["ffmpeg", "-y", "-v", "warning", "-i", mux_audio_path, "-i", temp_vid,
-                        "-c:v", "copy", out_path], check=True)
+        _run_guarded(["ffmpeg", "-y", "-v", "warning", "-i", mux_audio_path, "-i", temp_vid,
+                      "-c:v", "copy", out_path], dl, "mux", check=True)
         if not os.path.exists(out_path) or not os.path.getsize(out_path):
             # Inference ran but assembled no usable output (detection too sparse / gapped to mux the
             # %08d.png sequence): an honest no-usable-face soft-degrade, not a hard crash. A genuine
@@ -532,7 +660,7 @@ def _selftest(inp):
         if not out["sample_present"]:
             out["error"] = "baked sample missing (data/video/yongen.mp4 + data/audio/yongen.wav)"
             return out
-        _run_musetalk(face, audio, dst, version=version)
+        _run_musetalk(face, audio, dst, version=version, deadline=_Deadline())
         if not os.path.exists(dst) or not os.path.getsize(dst):
             out["error"] = "no output produced"
             return out
@@ -659,11 +787,14 @@ def _lipsync_r2(inp):
     face = os.path.join(work, "face.mp4")
     audio = os.path.join(work, "audio.wav")
     dst = os.path.join(work, "out.mp4")
+    # ONE budget per invocation, started before any I/O so the R2 fetches count against it.
+    dl = _Deadline()
     try:
         s3 = _r2()
         s3.download_file(R2_BUCKET, clip_key, face)
         s3.download_file(R2_BUCKET, audio_key, audio)
-        _run_musetalk(face, audio, dst, bbox_shift=bbox_shift, version=version)
+        dl.check("r2-download")
+        _run_musetalk(face, audio, dst, bbox_shift=bbox_shift, version=version, deadline=dl)
         if not os.path.getsize(dst):
             return {"ok": False, "error": "lipsync produced no output"}
         s3.upload_file(dst, R2_BUCKET, output_key, ExtraArgs={"ContentType": "video/mp4"})
@@ -702,10 +833,13 @@ def _lipsync_presigned(inp):
     face = os.path.join(work, "face.mp4")
     audio = os.path.join(work, "audio.wav")
     dst = os.path.join(work, "out.mp4")
+    # ONE budget per invocation, started before any I/O so the presigned fetches count against it.
+    dl = _Deadline()
     try:
-        _get(video_url, face)
-        _get(audio_url, audio)
-        _run_musetalk(face, audio, dst, bbox_shift=bbox_shift, version=version)
+        _get(video_url, face, deadline=dl)
+        _get(audio_url, audio, deadline=dl)
+        dl.check("presigned-download")
+        _run_musetalk(face, audio, dst, bbox_shift=bbox_shift, version=version, deadline=dl)
         size = os.path.getsize(dst)
         if not size:
             return {"ok": False, "error": "lipsync produced no output"}

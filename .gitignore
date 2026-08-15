@@ -11,3 +11,7 @@ deploy.env
 
 # Python virtualenv (local dev)
 .venv/
+
+# pytest-cov artifacts from a local gate run (CI uploads coverage.xml, never commits it)
+.coverage
+coverage.xml

@@ -5,7 +5,25 @@ consumer image. This file records the why behind each release; the tag is the ve
 
 ## Unreleased
 
-- Nothing yet.
+- **fix(lipsync): a per-invocation wall-clock guard on the compute path (#98).** The handler had no
+  wall-clock bound of any kind: 0 of 6 `subprocess.run` sites carried a `timeout=` (the single
+  `timeout=` in the file was the HTTP read on the presigned download), and there was no
+  `monotonic`, no `signal.alarm`, no clock of any sort in the non-test Python. Of the four finish
+  doors this was the one where the studio phase ceiling (`PHASE_HARD_DEADLINE_SECONDS`, 5400s) was
+  the SOLE backstop, and that ceiling fails the whole PHASE rather than degrading one step, so one
+  unbounded shot took a correctly-running film down with it (vivijure-core#182).
+  ONE budget is now established per invocation and threaded through every stage: 6 of 6 subprocess
+  sites go through a single guarded entry point that spends the remaining budget as the child
+  timeout, and 6 in-process stages (model load, whisper features, face detection, latent encode,
+  UNet inference, blending) check it, including inside the unbounded per-frame loops. On expiry the
+  job COMPLETES as the existing honest soft-degrade (`{ok:false, detail}`, no top-level `error`),
+  naming the guard and the elapsed seconds, so the studio passes the ORIGINAL clip through, tags it
+  `passthrough:backend-soft-degrade` and records the reason. It never raises: an escaping exception
+  would be booked FAILED with no structured output and fail the entire render.
+  Default 540s, env-overridable via `MAX_INVOCATION_SECONDS`: below the 600s reference deployment
+  execution timeout (so the honest degrade wins the race against the platform kill) and 3 * 540 plus
+  cold start plus queue wait stays at half the 5400s phase ceiling. Handler + tests + docs only; no
+  weight or base change.
 
 ## v1.0.6
 

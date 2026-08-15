@@ -116,6 +116,7 @@ import json,os
 # endpoint env: R2 finish-chain creds plus any handler tuning knobs you set in deploy.env.
 env={}
 for k in ("R2_ENDPOINT_URL","R2_BUCKET","R2_ACCESS_KEY_ID","R2_SECRET_ACCESS_KEY",
+          "MAX_INVOCATION_SECONDS",
           "MAX_OUTPUT_LONG_EDGE","FFMPEG_TIMEOUT","UPSCALE_BATCH","UPSCALE_TILE","UPSCALE_FP16"):
     v=os.environ.get(k,"")
     if v: env[k]=v
