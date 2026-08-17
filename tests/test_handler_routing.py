@@ -308,11 +308,15 @@ def test_presigned_stamps_sidecar_only_when_hash_url_provided(monkeypatch):
 # Night_Shift shot_01 shipped a 3-of-65-frame clip (0.17s for a 4s shot), deterministically, whenever an
 # early source frame had no detectable face. Root cause: blended output PNGs were named by the source LOOP
 # INDEX, so a dropped (degenerate-bbox) frame left a %08d hole; ffmpeg`s image2 reader stops at the first
-# missing index, truncating the clip to its first unbroken run. These cover the two pure guards that fix it.
+# missing index, truncating the clip to its first unbroken run. These cover the two pure guards that fix
+# the hole: contiguous numbering, and the honesty floor. #40 no longer DROPS those frames (it writes the
+# source frame), so the numbering helper is now the defense against a future skip, not the emit path.
+# Keep these assertions as they are: they test the helpers, not the new passthrough.
 
 def _emit_names_like_the_loop(keep_flags):
-    """Reproduce the blend loop`s output-naming for a sequence of keep/drop decisions, using the FIXED
-    contiguous counter. A dropped frame (keep=False) is `continue`d exactly as the loop does."""
+    """Reproduce contiguous output-naming for a sequence of keep/skip decisions. A skipped frame
+    (keep=False) is not emitted; the counter still has no hole. #40`s blend loop no longer skips,
+    but the helper must stay hole-free if anything later does."""
     names = []
     written = 0
     for keep in keep_flags:
@@ -360,6 +364,135 @@ def test_too_short_floor_is_inclusive():
 
 def test_too_short_never_trips_on_zero_expected():
     assert handler._lipsync_too_short(0, 0) is False
+
+
+# --- #40: passthrough the SOURCE frame on a degenerate bbox (pure, GPU-free) -------------------
+# A dropped no-face frame used to shorten the sequence vs the audio even after #38 closed the %08d
+# hole. On a placeholder or zero-area bbox the blend loop now writes the untouched source frame at
+# that index. Frame count out == frame count in for any bbox pattern. The honesty floor still runs
+# on blended vs (blended + passthrough): a 6/64-face clip SoftDegrades instead of shipping stills.
+
+_PLACEHOLDER = (0.0, 0.0, 0.0, 0.0)
+_GOOD_BBOX = (10, 20, 80, 90)
+_ZERO_AREA = (10, 20, 10, 90)   # x2 == x1
+_NEG_AREA = (80, 20, 10, 90)    # x2 < x1
+
+
+def _emit_like_blend_loop(bboxes, speech_end=None, placeholder=_PLACEHOLDER):
+    """Drive the production classifiers the blend loop uses. Every frame emits a name."""
+    if speech_end is None:
+        speech_end = len(bboxes)
+    names = []
+    blended = passthrough = hold = 0
+    for i, bbox in enumerate(bboxes):
+        action = handler._blend_frame_action(bbox, placeholder, i, speech_end)
+        names.append(handler._blended_frame_name(len(names)))
+        if action == "blend":
+            blended += 1
+        elif action == "passthrough":
+            passthrough += 1
+        else:
+            hold += 1
+    return names, blended, passthrough, hold
+
+
+def test_blend_action_placeholder_is_passthrough():
+    assert handler._blend_frame_action(_PLACEHOLDER, _PLACEHOLDER, 0, 10) == "passthrough"
+
+
+def test_blend_action_zero_area_is_passthrough():
+    assert handler._blend_frame_action(_ZERO_AREA, _PLACEHOLDER, 0, 10) == "passthrough"
+    assert handler._blend_frame_action(_NEG_AREA, _PLACEHOLDER, 0, 10) == "passthrough"
+
+
+def test_blend_action_unusable_bbox_is_passthrough():
+    assert handler._blend_frame_action(None, _PLACEHOLDER, 0, 10) == "passthrough"
+    assert handler._blend_frame_action((1, 2), _PLACEHOLDER, 0, 10) == "passthrough"
+
+
+def test_blend_action_good_bbox_is_blend():
+    assert handler._blend_frame_action(_GOOD_BBOX, _PLACEHOLDER, 0, 10) == "blend"
+
+
+def test_blend_action_silence_tail_is_hold():
+    # #67 path is unchanged: i >= speech_end holds even on a good bbox.
+    assert handler._blend_frame_action(_GOOD_BBOX, _PLACEHOLDER, 5, 5) == "hold"
+    assert handler._blend_frame_action(_PLACEHOLDER, _PLACEHOLDER, 5, 5) == "hold"
+
+
+def test_degenerate_bbox_midclip_emits_full_length():
+    # Historical shot_01 signature: frame 3 is unusable. Must emit 6 names, no hole, one passthrough.
+    bboxes = [_GOOD_BBOX, _GOOD_BBOX, _GOOD_BBOX, _ZERO_AREA, _GOOD_BBOX, _GOOD_BBOX]
+    names, blended, passthrough, hold = _emit_like_blend_loop(bboxes)
+    assert names == [f"{i:08d}.png" for i in range(6)]
+    assert len(names) == len(bboxes)
+    assert blended == 5 and passthrough == 1 and hold == 0
+    assert handler._lipsync_too_short(blended, blended + passthrough) is False
+
+
+def test_placeholder_midclip_emits_full_length():
+    bboxes = [_GOOD_BBOX, _PLACEHOLDER, _GOOD_BBOX, _GOOD_BBOX]
+    names, blended, passthrough, hold = _emit_like_blend_loop(bboxes)
+    assert len(names) == 4
+    assert names == ["00000000.png", "00000001.png", "00000002.png", "00000003.png"]
+    assert blended == 3 and passthrough == 1 and hold == 0
+
+
+def test_any_bbox_pattern_frame_count_matches_source():
+    # Definition of done: frame count out == frame count in for any bbox pattern.
+    patterns = [
+        [_GOOD_BBOX] * 8,
+        [_PLACEHOLDER] * 8,
+        [_ZERO_AREA] * 8,
+        [_GOOD_BBOX, _PLACEHOLDER, _ZERO_AREA, _GOOD_BBOX, _NEG_AREA, _GOOD_BBOX],
+        [_PLACEHOLDER, _GOOD_BBOX, _PLACEHOLDER],
+    ]
+    for bboxes in patterns:
+        names, blended, passthrough, hold = _emit_like_blend_loop(bboxes)
+        assert len(names) == len(bboxes), bboxes
+        assert blended + passthrough + hold == len(bboxes)
+        assert names == [f"{i:08d}.png" for i in range(len(bboxes))]
+
+
+def test_mostly_passthrough_still_trips_the_floor():
+    # 6 real mouths + 58 source passthroughs: full length, but still SoftDegrade. This is the
+    # Night_Shift shot_01 honesty case after #40: do not ship a 6-face still as a sync success.
+    blended, passthrough = 6, 58
+    assert handler._lipsync_too_short(blended, blended + passthrough) is True
+
+
+def test_zero_blended_is_no_face_even_when_length_is_full():
+    # A clip that never found a face must not ship a silent identity copy wearing a success tag.
+    names, blended, passthrough, hold = _emit_like_blend_loop([_PLACEHOLDER] * 12)
+    assert len(names) == 12
+    assert blended == 0 and passthrough == 12
+    # The production loop SoftDegrades on `if not blended_count` before the ratio check.
+    assert blended == 0
+
+
+def test_speech_window_floor_ignores_silence_holds():
+    # Short dialogue over a long shot (#67): 32 mouthed + 33 rest-holds. Floor is over the speech
+    # window (32/32), not 32/65, so a clean face on a padded line still ships.
+    bboxes = [_GOOD_BBOX] * 65
+    names, blended, passthrough, hold = _emit_like_blend_loop(bboxes, speech_end=32)
+    assert len(names) == 65
+    assert blended == 32 and passthrough == 0 and hold == 33
+    assert handler._lipsync_too_short(blended, blended + passthrough) is False
+
+
+def test_handler_source_passthroughs_instead_of_dropping():
+    # Canary on the shipped source: the v0.1.5 drop comment is gone, and the resize except writes
+    # ori_frame instead of continuing with no emit.
+    src = _handler_source()
+    assert "a degenerate bbox drops that frame" not in src
+    assert "if not blended_count" in src
+    marker = "cv2.resize(res_frame.astype(np.uint8)"
+    resize_at = src.find(marker)
+    assert resize_at != -1
+    window = src[resize_at:resize_at + 500]
+    assert "except Exception" in window
+    assert "ori_frame" in window
+    assert "passthrough_count" in window
 
 
 # --- #67: silence-pad tail rest-hold (pure, GPU-free) ----------------------------------------

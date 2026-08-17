@@ -5,6 +5,15 @@ consumer image. This file records the why behind each release; the tag is the ve
 
 ## Unreleased
 
+- **fix(lipsync): passthrough the source frame on a degenerate bbox (#40).** A placeholder or
+  zero-area face box used to `continue` out of the blend loop, so a clip that still cleared the
+  honesty floor shipped shorter than its audio. The loop now writes the untouched source frame at
+  that index (exact audio length, zero dropped frames) and only blends a generated mouth onto a
+  usable box. Silence-tail rest-holds (#67) are unchanged. The floor now counts blended mouths
+  against the speech-window attempt count (blended + passthrough): a clip that never found a face
+  still SoftDegrades, and a 6/64-face clip still cannot ship as a success. Handler + tests only;
+  no weight or base change.
+
 - **fix(serve): an oversize or unparseable POST /run is no longer accepted as an empty job (#94).**
   `_body()` answered `None` for no body, a body past the 1 MiB cap, and a body that would not
   parse, and `/run` then did `(body or {}).get("input", body or {})`, so all three were accepted
