@@ -121,11 +121,12 @@ PARSING_MODE = "jaw"
 AUDIO_PAD_LEFT = 2
 AUDIO_PAD_RIGHT = 2
 
-# #702: minimum fraction of the audio-driven frames a lip-sync must actually emit before we trust it.
-# Below this the face was undetectable for most of the clip, so the "synced" output is a stutter far
-# shorter than its audio (shot_01 once shipped 3 of 65 frames -> 0.17s). We SoftDegrade to the ORIGINAL
-# clip -- honest, full-length, un-synced -- rather than a truncated lie. Mirrors the studio duration gate
-# floor (vivijure #697).
+# #702 / #40: minimum fraction of SPEECH-WINDOW frames that must carry a real blended mouth before we
+# trust the sync. #40 writes the source frame on a placeholder / degenerate bbox so the sequence is
+# never short of the audio, but a mostly-faceless clip must still SoftDegrade (a 6/64-face clip must
+# not ship as a success wearing still identity frames). Denominator is blended + passthrough (the
+# frames we tried to mouth), never silence-tail holds (#67 rest-holds are not detection misses).
+# Mirrors the studio duration gate floor (vivijure #697).
 LIPSYNC_MIN_FRAME_RATIO = 0.5
 
 # UNet weights, relative to MUSETALK_DIR (inference runs with cwd=MUSETALK_DIR).
@@ -463,16 +464,33 @@ def _pipeline(version):
 def _blended_frame_name(written):
     """CONTIGUOUS %08d filename for the blended-frame sequence. ffmpeg`s image2 reader stops at the first
     MISSING index, so an emitted frame MUST be numbered by how many frames we have WRITTEN so far, never by
-    the source-loop index: a dropped (no-face / degenerate-bbox) frame must not punch a hole that silently
-    truncates the whole encode to its first unbroken run. That hole deterministically cut Night_Shift
-    shot_01 to 3 of 65 frames whenever an early frame had no detectable face (vivijure #702)."""
+    the source-loop index. #40 no longer drops a degenerate bbox (it writes the source frame), but the
+    counter stays the defense: any future skip must not punch a hole. That hole once cut Night_Shift
+    shot_01 to 3 of 65 frames (vivijure #702)."""
     return f"{written:08d}.png"
 
 
+def _blend_frame_action(bbox, coord_placeholder, i, speech_end):
+    """Classify one blend-loop frame. hold = #67 silence tail (freeze last mouth). passthrough = #40
+    placeholder or degenerate bbox (write the untouched source frame). blend = usable face region."""
+    if i >= speech_end:
+        return "hold"
+    if bbox == coord_placeholder:
+        return "passthrough"
+    try:
+        x1, y1, x2, y2 = bbox
+    except (TypeError, ValueError):
+        return "passthrough"
+    if (x2 - x1) <= 0 or (y2 - y1) <= 0:
+        return "passthrough"
+    return "blend"
+
+
 def _lipsync_too_short(written, expected, ratio=LIPSYNC_MIN_FRAME_RATIO):
-    """True when a lip-sync emitted materially fewer frames than its audio drove -- the face was
-    undetectable for most of the clip, so the output is a stutter far shorter than the dialogue. `written`
-    = frames actually blended + encoded; `expected` = the audio-driven frame count (vivijure #702)."""
+    """True when a lip-sync mouthed materially fewer frames than it attempted. `written` is the
+    blended (real-mouth) count; `expected` is the speech-window attempt count (blended + source
+    passthrough). Silence-tail holds are neither: they are rest-holds, not detection misses
+    (vivijure #702 / musetalk #40)."""
     return expected > 0 and written < expected * ratio
 
 
@@ -569,54 +587,65 @@ def _run_musetalk(face_path, audio_path, out_path, bbox_shift=0, version="v15", 
                 for res_frame in vae.decode_latents(pred_latents):
                     res_frame_list.append(res_frame)
 
-        # Blend each generated mouth back into its source frame. `written` counts frames that landed
-        # on a real face bbox: a placeholder / degenerate bbox (a false-positive detection on a faceless
-        # clip, e.g. a lighthouse) resizes to a zero area and is dropped here, exactly as upstream does.
+        # Blend each generated mouth back into its source frame. #40: a placeholder / degenerate bbox
+        # writes the UNTOUCHED source frame at that index (exact audio length, zero dropped frames).
+        # Silence-tail (#67) is already a hold of the last mouthed frame; leave it. `written` is the
+        # emit counter (contiguous %08d); blended vs passthrough decide whether the sync is honest.
         written = 0
+        blended_count = 0
+        passthrough_count = 0
         last_blended = None
         for i, res_frame in enumerate(res_frame_list):
             # Checked at the TOP of the body, OUTSIDE the per-frame try/except below: that handler
-            # swallows any exception to drop a degenerate frame, and would swallow the guard too.
+            # swallows a resize failure to passthrough the source frame, and would swallow the guard too.
             dl.check("blend")
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
             ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
-            if i >= speech_end:
+            action = _blend_frame_action(bbox, coord_placeholder, i, speech_end)
+            if action == "hold":
                 # #67: silence tail -- freeze the last synced mouth, not generative whisper jitter.
                 hold = last_blended if last_blended is not None else ori_frame
                 cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), hold)
                 written += 1
+                continue
+            if action == "passthrough":
+                # #40: keep the source frame; do not punch a hole and do not claim a mouth.
+                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), ori_frame)
+                written += 1
+                passthrough_count += 1
                 continue
             x1, y1, x2, y2 = bbox
             if version == "v15":
                 y2 = min(y2 + EXTRA_MARGIN, ori_frame.shape[0])
             try:
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-            except Exception:  # noqa: BLE001 -- a degenerate bbox drops that frame, as upstream does
+            except Exception:  # noqa: BLE001 -- cv2 resize fail is the same unusable face as a 0-area bbox
+                cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), ori_frame)
+                written += 1
+                passthrough_count += 1
                 continue
             if version == "v15":
                 combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=PARSING_MODE, fp=fp)
             else:
                 combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
-            # #702: number by frames WRITTEN, not the loop index i. A dropped frame above must not leave
-            # a %08d gap -- the image2 encoder below stops at the first missing index, which
-            # deterministically truncated shot_01 to 3 of 65 frames (0.17s) on any early no-face frame.
+            # #702: number by frames WRITTEN, not the loop index i. image2 stops at the first missing
+            # index; #40 no longer skips, but the counter stays the defense against a future hole.
             cv2.imwrite(os.path.join(out_frames_dir, _blended_frame_name(written)), combine)
             last_blended = combine
             written += 1
+            blended_count += 1
 
-        # No blended frame landed on a usable face region: the detector false-positived on a faceless
-        # clip (input_latent_list was not empty, so the guard above did not fire) but every candidate
-        # bbox was a placeholder / degenerate. Honest no-face soft-degrade (a superset of the
-        # empty-latent guard), not the confusing post-mux "produced no output mp4".
-        if not written:
+        # Zero usable faces: the detector false-positived (input_latent_list was not empty) but every
+        # speech-window bbox was a placeholder / degenerate. Do not ship a silent identity copy as a
+        # success. Honest no-face soft-degrade, not the confusing post-mux "produced no output mp4".
+        if not blended_count:
             raise SoftDegrade("no face detected in clip")
-        # #702: the face was detectable for too little of the clip -- the emitted sequence is a stutter far
-        # shorter than the audio. Ship the ORIGINAL clip (honest soft-degrade, the lipsync module passes it
-        # through), never a truncated lip-sync that the studio duration gate then rejects.
-        expected_frames = len(res_frame_list)
-        if _lipsync_too_short(written, expected_frames):
+        # #702 / #40: face undetectable for most of the SPEECH WINDOW. Passthrough keeps length, so
+        # `written` is no longer the honesty signal; blended vs (blended + passthrough) is.
+        expected_frames = blended_count + passthrough_count
+        if _lipsync_too_short(blended_count, expected_frames):
             raise SoftDegrade(
-                f"lip-sync kept only {written}/{expected_frames} frames "
+                f"lip-sync kept only {blended_count}/{expected_frames} frames "
                 "(face undetectable for most of the clip)")
 
         # Encode the blended frames, then mux the audio back in.
