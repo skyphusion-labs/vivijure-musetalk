@@ -5,6 +5,14 @@ consumer image. This file records the why behind each release; the tag is the ve
 
 ## Unreleased
 
+- **fix(serve): an oversize or unparseable POST /run is no longer accepted as an empty job (#94).**
+  `_body()` answered `None` for no body, a body past the 1 MiB cap, and a body that would not
+  parse, and `/run` then did `(body or {}).get("input", body or {})`, so all three were accepted
+  with `200` and a job id. The caller got a success shape for a request that was never honoured,
+  and the job failed later naming a missing field rather than the body. Now `413` and `400`
+  respectively, checked AFTER authentication so an unauthenticated caller still gets `401` and
+  learns nothing about the cap. Ported from vivijure-blender.
+
 - **fix(lipsync): a per-invocation wall-clock guard on the compute path (#98).** The handler had no
   wall-clock bound of any kind: 0 of 6 `subprocess.run` sites carried a `timeout=` (the single
   `timeout=` in the file was the HTTP read on the presigned download), and there was no
