@@ -120,6 +120,66 @@ def test_body_cap_constant_is_sane():
     assert S.MAX_HTTP_BODY_BYTES == 1_048_576
 
 
+# ------------------------------------------------- #94: rejected body is not an empty job
+
+def test_oversize_sentinel_is_413_and_does_not_submit():
+    """route() used to collapse BODY_TOO_LARGE into (body or {}), i.e. an empty job."""
+    seen = []
+    registry = S.JobRegistry(lambda payload, should_cancel: seen.append(payload) or {"ok": True})
+    status, payload = S.route(
+        "POST", "/run", S.BODY_TOO_LARGE,
+        registry=registry, token=TOKEN, expected_token=TOKEN, service="test-service",
+    )
+    assert status == 413, f"oversize sentinel accepted as a job: {status} {payload}"
+    assert payload.get("ok") is False
+    assert "exceeds" in payload.get("error", "")
+    time.sleep(0.05)
+    assert seen == [], f"oversize sentinel was submitted: {seen}"
+
+
+def test_invalid_sentinel_is_400_and_does_not_submit():
+    seen = []
+    registry = S.JobRegistry(lambda payload, should_cancel: seen.append(payload) or {"ok": True})
+    status, payload = S.route(
+        "POST", "/run", S.BODY_INVALID,
+        registry=registry, token=TOKEN, expected_token=TOKEN, service="test-service",
+    )
+    assert status == 400, f"invalid sentinel accepted as a job: {status} {payload}"
+    assert payload.get("ok") is False
+    assert "not valid JSON" in payload.get("error", "")
+    time.sleep(0.05)
+    assert seen == [], f"invalid sentinel was submitted: {seen}"
+
+
+def test_oversize_sentinel_without_a_token_is_401_not_413():
+    """Auth first: an unauthenticated caller must not learn the cap (#93 ordering)."""
+    status, payload = _route("POST", "/run", S.BODY_TOO_LARGE, token=None)
+    assert status == 401, f"unauthenticated oversize disclosed the cap: {status} {payload}"
+    assert payload.get("error") == "unauthorized"
+
+
+def test_invalid_sentinel_without_a_token_is_401_not_400():
+    status, payload = _route("POST", "/run", S.BODY_INVALID, token=None)
+    assert status == 401, f"unauthenticated invalid body skipped auth: {status} {payload}"
+    assert payload.get("error") == "unauthorized"
+
+
+def test_absent_body_is_still_accepted_as_an_empty_job():
+    """Control: None (no body) must stay distinct from a rejected body, or /run with
+    an empty POST would start returning 413/400 and this fix would have broken the door."""
+    seen = []
+    registry = S.JobRegistry(lambda payload, should_cancel: seen.append(payload) or {"ok": True})
+    status, payload = S.route(
+        "POST", "/run", None,
+        registry=registry, token=TOKEN, expected_token=TOKEN, service="test-service",
+    )
+    assert status == 200 and "id" in payload
+    deadline = time.time() + 10
+    while not seen and time.time() < deadline:
+        time.sleep(0.02)
+    assert seen == [{}], f"absent body did not become an empty job: {seen}"
+
+
 SERVER_SRC = '''
 import json, sys
 sys.path.insert(0, {repo!r})
@@ -207,6 +267,30 @@ def _post(port, raw: bytes, token=TOKEN):
         return e.code, json.loads(e.read() or b"{}")
 
 
+def _post_claimed_length(port, raw: bytes, claimed_length: int, token=TOKEN):
+    """POST with a Content-Length that is not the bytes we actually send.
+
+    _body() decides oversize from the header and returns BEFORE rfile.read, so
+    a live over-cap test must not ship a 1 MiB+ body: the door closes without
+    reading and the client is reset mid-send. Lying about the length is the
+    actual decision the cap makes.
+    """
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    try:
+        conn.putrequest("POST", "/run")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Authorization", f"Bearer {token}")
+        conn.putheader("Content-Length", str(claimed_length))
+        conn.endheaders()
+        if raw:
+            conn.send(raw)
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read() or b"{}")
+    finally:
+        conn.close()
+
+
 def test_body_under_the_cap_is_delivered(live_server):
     """POSITIVE CONTROL: without this, the over-cap test could pass against a dead server."""
     port, record = live_server
@@ -218,19 +302,41 @@ def test_body_under_the_cap_is_delivered(live_server):
     assert got[-1] == {"project": "small"}, f"under-cap body not delivered: {got[-1]}"
 
 
-def test_body_over_the_cap_is_not_parsed(live_server):
-    """THE DEFECT: an unbounded content-length read. Over-cap bodies must be dropped."""
+def test_body_over_the_cap_is_413_not_an_empty_job(live_server):
+    """#94: over-cap used to return 200 + a job id whose payload was {}. Now 413, no job."""
     port, record = live_server
     before = len(_received(record))
-    big = json.dumps(
-        {"input": {"project": "x", "pad": "A" * (S.MAX_HTTP_BODY_BYTES + 1024)}}
-    ).encode()
-    assert len(big) > S.MAX_HTTP_BODY_BYTES
-    status, payload = _post(port, big)
-    assert status == 200 and "id" in payload
-    got = _await_one_more(record, before)
-    assert len(got) > before, "over-cap job never reached the handler at all"
-    assert got[-1] == {}, f"over-cap body was parsed and delivered: {str(got[-1])[:200]}"
+    claimed = S.MAX_HTTP_BODY_BYTES + 1
+    status, payload = _post_claimed_length(port, b'{"input":{"project":"x"}}', claimed)
+    assert status == 413, f"over-cap accepted as a job: {status} {payload}"
+    assert payload.get("ok") is False
+    assert "exceeds" in payload.get("error", "")
+    time.sleep(0.1)
+    got = _received(record)
+    assert len(got) == before, f"over-cap body was submitted: {got[before:]}"
+
+
+def test_unparseable_body_is_400_not_an_empty_job(live_server):
+    port, record = live_server
+    before = len(_received(record))
+    status, payload = _post(port, b"this is not json {")
+    assert status == 400, f"unparseable body accepted as a job: {status} {payload}"
+    assert payload.get("ok") is False
+    assert "not valid JSON" in payload.get("error", "")
+    time.sleep(0.1)
+    got = _received(record)
+    assert len(got) == before, f"unparseable body was submitted: {got[before:]}"
+
+
+def test_oversize_without_a_token_is_401_over_a_real_socket(live_server):
+    """Auth still wins over the cap: 413 here would leak the limit to anyone who can POST."""
+    port, _ = live_server
+    claimed = S.MAX_HTTP_BODY_BYTES + 1
+    status, payload = _post_claimed_length(
+        port, b'{"input":{"project":"x"}}', claimed, token="wrong-token",
+    )
+    assert status == 401, f"unauthenticated oversize disclosed the cap: {status} {payload}"
+    assert payload.get("error") == "unauthorized"
 
 
 def test_unauthenticated_selftest_over_a_real_socket(live_server):
