@@ -9,8 +9,14 @@ name: base-build
 # Dockerfile then repins its FROM ...@sha256 digest to the printed value. It is NOT wired to push/tag
 # triggers, so a routine commit can never silently re-bake the base and un-pin the consumer.
 #
-# Runner: Plane C `[self-hosted, bake-capable]` (vivijure-gpu-builds; fc#754). Disk-reclaim stays
-# hosted-only (propagandhi has TB-class free space).
+# Runner: GitHub-hosted `ubuntu-latest`. Plane C `[self-hosted, bake-capable]`
+# (vivijure-gpu-builds; fc#754) and propagandhi's TB-class free space are HISTORY: the fleet was
+# decommissioned 2026-09-24 on cost, so that label resolves to no runner and a job still pinned
+# to it does not fail, it QUEUES FOREVER and silently. This workflow stays dispatch-only, so it
+# is not fork-reachable on a hosted runner either. The disk-reclaim step below is now
+# LOAD-BEARING rather than a no-op: its `runner.environment == 'github-hosted'` guard is TRUE
+# here, and this base is ~18.2 GB compressed with a 7.2 GB largest layer, so hosted free disk is
+# the binding constraint on the bake.
 
 on:
   workflow_dispatch:
@@ -30,7 +36,9 @@ concurrency:
 
 jobs:
   base:
-    runs-on: [self-hosted, bake-capable]
+    # Plane C is gone (fleet decommissioned 2026-09-24); ubuntu-latest is the only live CI
+    # plane, and this base has 1 prior successful bake there.
+    runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-musetalk
